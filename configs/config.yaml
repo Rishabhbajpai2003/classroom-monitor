@@ -1,0 +1,47 @@
+detection:
+  model_size: yolo26s
+  confidence_threshold: 0.25
+  image_size: 1280
+
+tracking:
+  max_age: 30
+  min_hits: 3
+  iou_threshold: 0.3
+  max_cosine_distance: 0.4
+  nn_budget: 100
+  embedder: mobilenet
+  embedder_gpu: true
+
+identity:
+  embedding_similarity_threshold: 0.75
+  registry_path: data/student_registry.json
+  embedding_model: mobilenet_v3_small
+
+attendance:
+  presence_threshold_seconds: 30
+  min_track_frames: 20
+
+attention:
+  ema_alpha: 0.08
+  confidence_weighted: true
+  enter_attentive: 0.2
+  exit_attentive: 0.0
+  enter_distracted: -0.2
+  exit_distracted: 0.0
+  min_state_hold: 15
+  weights:
+    looking_forward: 1.0
+    hand_raised: 1.0
+    distracted: -1.0
+    using_phone: -2.0
+
+system:
+  device: auto
+  headless: false
+  save_video: true
+  save_csv: true
+  camera_id: cam_01
+  frame_skip: 2
+  pose_skip: 5
+  output_dir: outputs
+  log_level: INFO
