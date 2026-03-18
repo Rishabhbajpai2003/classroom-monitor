@@ -46,7 +46,7 @@ class PoseAnalyzer:
                 device = "cpu"
 
         self.device = device
-        model_name = "yolo11n-pose.pt"
+        model_name = "weights/yolo11x-pose.pt"
         logger.info(f"Loading PoseAnalyzer model: {model_name} on {self.device}")
         self.model = YOLO(model_name)
 
@@ -81,7 +81,7 @@ class PoseAnalyzer:
                 frame,
                 device=self.device,
                 verbose=False,
-                imgsz=640,  # Lower res for speed — pose doesn't need 1280
+                imgsz=960,  # Increased res to support distant head landmarks
             )[0]
 
             if results.keypoints is None or len(results.keypoints) == 0:

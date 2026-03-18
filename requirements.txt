@@ -11,3 +11,9 @@ pyyaml
 scikit-learn
 mediapipe==0.10.14
 yt-dlp==2026.2.4
+transformers
+configargparse
+decord
+einops
+linear-attention-transformer
+local-attention

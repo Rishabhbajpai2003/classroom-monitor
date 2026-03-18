@@ -1,0 +1,1 @@
+"""Visual speech detector package."""
