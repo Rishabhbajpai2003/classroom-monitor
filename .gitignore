@@ -7,3 +7,6 @@ media/
 outputs/
 proof_keyframes/
 _downloads/
+cloudflared.exe
+data/ava_active_speaker/ava_activespeaker_train_flat.csv
+data/ava_active_speaker/ava_activespeaker_val_flat.csv
