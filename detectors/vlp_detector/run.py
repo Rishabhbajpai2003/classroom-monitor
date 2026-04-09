@@ -25,7 +25,12 @@ from app.models.seat_map import (
     save_seat_map_png,
 )
 from app.models.speech_topics import SpeechTopicClassifier
-from app.models.student_backbone import format_student_global_id, seat_anchor_point
+from app.models.student_backbone import (
+    format_student_display_name,
+    format_student_global_id,
+    seat_anchor_point,
+    student_metadata_fields,
+)
 from detectors.vsd_detector.common import (
     TrackClipBuffer,
     crop_face_context,
@@ -170,7 +175,9 @@ def draw_overlay(
 
     status = "talking" if state.speech_prob >= threshold else "idle"
     seat_text = seat_id or "--"
-    label = f"{global_id} {seat_text} | {status} {state.speech_prob:.2f}"
+    metadata = getattr(track, "metadata", None)
+    display_name = format_student_display_name(track.track_id, metadata)
+    label = f"{display_name} {seat_text} | {status} {state.speech_prob:.2f}"
     (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2)
     y_top = max(0, y1 - th - 8)
     y_bottom = max(th + 8, y1)
@@ -290,6 +297,10 @@ def main() -> None:
             csv_file,
             fieldnames=[
                 "global_id",
+                "display_name",
+                "student_name",
+                "roll_number",
+                "student_key",
                 "track_id",
                 "seat_id",
                 "start_frame_idx",
@@ -360,6 +371,7 @@ def main() -> None:
         resolved_track = tracker.get_track_by_any_id(track_id)
         metadata = getattr(resolved_track, "metadata", None) if resolved_track is not None else None
         global_id = format_student_global_id(track_id, metadata)
+        meta = student_metadata_fields(metadata)
 
         state.last_transcript = transcript
         state.last_topic_label = topic_result["topic_label"]
@@ -371,6 +383,10 @@ def main() -> None:
         if csv_writer is not None and transcript:
             row = {
                 "global_id": global_id,
+                "display_name": format_student_display_name(track_id, metadata),
+                "student_name": meta.get("student_name", ""),
+                "roll_number": meta.get("roll_number", ""),
+                "student_key": meta.get("student_key", ""),
                 "track_id": track_id,
                 "seat_id": segment_seat_id or "",
                 "start_frame_idx": state.segment_frame_indices[0],
@@ -543,6 +559,10 @@ def main() -> None:
                 handle,
                 fieldnames=[
                     "global_id",
+                    "display_name",
+                    "student_name",
+                    "roll_number",
+                    "student_key",
                     "track_id",
                     "seat_id",
                     "start_frame_idx",
@@ -556,6 +576,10 @@ def main() -> None:
                 writer.writerow(
                     {
                         "global_id": row["global_id"],
+                        "display_name": row.get("display_name", ""),
+                        "student_name": row.get("student_name", ""),
+                        "roll_number": row.get("roll_number", ""),
+                        "student_key": row.get("student_key", ""),
                         "track_id": row["track_id"],
                         "seat_id": row["seat_id"],
                         "start_frame_idx": row["start_frame_idx"],
@@ -569,6 +593,10 @@ def main() -> None:
                 handle,
                 fieldnames=[
                     "global_id",
+                    "display_name",
+                    "student_name",
+                    "roll_number",
+                    "student_key",
                     "track_id",
                     "seat_id",
                     "start_frame_idx",
@@ -586,6 +614,10 @@ def main() -> None:
                 writer.writerow(
                     {
                         "global_id": row["global_id"],
+                        "display_name": row.get("display_name", ""),
+                        "student_name": row.get("student_name", ""),
+                        "roll_number": row.get("roll_number", ""),
+                        "student_key": row.get("student_key", ""),
                         "track_id": row["track_id"],
                         "seat_id": row["seat_id"],
                         "start_frame_idx": row["start_frame_idx"],

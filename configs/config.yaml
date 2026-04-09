@@ -110,5 +110,7 @@ system:
   report_min_presence_seconds: 0.5
   report_min_track_frames_unnamed: 60
   report_min_presence_seconds_unnamed: 8.0
+  overlay_min_track_frames_unnamed: 24
+  overlay_min_presence_seconds_unnamed: 3.0
   output_dir: outputs
   log_level: INFO

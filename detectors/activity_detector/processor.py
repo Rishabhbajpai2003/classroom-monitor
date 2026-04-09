@@ -20,7 +20,13 @@ from app.models.seat_map import (
     save_seat_map_json,
     save_seat_map_png,
 )
-from app.models.student_backbone import SharedStudentBackbone, StudentObservation, seat_anchor_point
+from app.models.student_backbone import (
+    SharedStudentBackbone,
+    StudentObservation,
+    format_student_display_name,
+    seat_anchor_point,
+    student_metadata_fields,
+)
 from app.utils.draw_utils import draw_labeled_box, draw_pose_skeleton
 from app.utils.source_utils import is_youtube_url, resolve_source
 from app.utils.vision_utils import normalize_list, point_to_box_distance
@@ -245,6 +251,7 @@ def _signal_rows(
     records: dict[str, StudentActivityRecord],
     interval_rows: list[dict],
     seating_summary: dict[str, dict],
+    student_metadata_map: dict[str, dict[str, str]],
     fps_out: float,
 ) -> list[dict]:
     rows: list[dict] = []
@@ -254,10 +261,20 @@ def _signal_rows(
         if signal_frames <= 0 and record.last_primary != signal_name:
             continue
         seat_info = seating_summary.get(person_id, {})
+        meta = dict(
+            student_metadata_map.get(
+                person_id,
+                {"display_name": "Unknown", "student_name": "", "roll_number": "", "student_key": ""},
+            )
+        )
         rows.append(
             {
                 "record_type": "summary",
                 "person_id": person_id,
+                "display_name": meta.get("display_name", ""),
+                "student_name": meta.get("student_name", ""),
+                "roll_number": meta.get("roll_number", ""),
+                "student_key": meta.get("student_key", ""),
                 "track_id": record.track_id,
                 "seat_id": seat_info.get("seat_id") or "",
                 "seat_rank": seat_info.get("seat_rank") or "",
@@ -278,10 +295,20 @@ def _signal_rows(
             continue
         person_id = row["person_id"]
         seat_info = seating_summary.get(person_id, {})
+        meta = dict(
+            student_metadata_map.get(
+                person_id,
+                {"display_name": "Unknown", "student_name": "", "roll_number": "", "student_key": ""},
+            )
+        )
         rows.append(
             {
                 "record_type": "interval",
                 "person_id": person_id,
+                "display_name": meta.get("display_name", ""),
+                "student_name": meta.get("student_name", ""),
+                "roll_number": meta.get("roll_number", ""),
+                "student_key": meta.get("student_key", ""),
                 "track_id": row.get("track_id", ""),
                 "seat_id": row.get("seat_id", "") or seat_info.get("seat_id") or "",
                 "seat_rank": seat_info.get("seat_rank") or "",
@@ -646,7 +673,41 @@ def run_pipeline(args):
     cached_objects: list[dict] = []
     cached_pose: dict[int, tuple[int, dict]] = {}
     records: dict[str, StudentActivityRecord] = {}
+    student_metadata_map: dict[str, dict[str, str]] = {}
     interval_tracker = ActivityIntervalTracker(fps_out)
+    overlay_min_unnamed_frames = max(24, int(round(fps_out * 0.75)))
+    overlay_min_unnamed_seconds = 3.0
+
+    def remember_student_metadata(obs: StudentObservation) -> None:
+        metadata = getattr(obs.face_track, "metadata", None) if obs.face_track is not None else None
+        fields = student_metadata_fields(metadata)
+        fields["display_name"] = format_student_display_name(obs.track_id, metadata)
+        student_metadata_map[obs.global_id] = fields
+
+    def student_metadata_row(student_id: str) -> dict[str, str]:
+        return dict(
+            student_metadata_map.get(
+                student_id,
+                {
+                    "student_name": "",
+                    "roll_number": "",
+                    "student_key": "",
+                    "display_name": "Unknown" if str(student_id).startswith("TEMP_") else str(student_id),
+                },
+            )
+        )
+
+    def should_render_overlay(student_id: str, seat_id: str = "") -> bool:
+        if not str(student_id).startswith("TEMP_"):
+            return True
+        record = records.get(student_id)
+        if record is None:
+            return False
+        return (
+            record.seen_frames >= overlay_min_unnamed_frames
+            and (record.seen_frames / max(1e-6, fps_out)) >= overlay_min_unnamed_seconds
+            and bool(seat_id)
+        )
     seat_event_engine = None
     seat_projection_manager = None
     seat_map = []
@@ -731,6 +792,7 @@ def run_pipeline(args):
                 draw_labeled_box(frame, obj["bbox"], f"{obj['class_name']} {obj['confidence']:.2f}", color, 1)
 
             for obs in observations:
+                remember_student_metadata(obs)
                 record = records.setdefault(obs.global_id, StudentActivityRecord(track_id=obs.track_id))
                 record.track_id = obs.track_id
                 record.seen_frames += 1
@@ -776,14 +838,26 @@ def run_pipeline(args):
                     "idle": (255, 180, 0),
                     "unknown": (140, 140, 140),
                 }
-                draw_labeled_box(
-                    frame,
-                    ref_box,
-                    f"{obs.global_id} {seat_id or '--'} {primary} {confidence:.2f} {mode} {seat_state}",
-                    color_map.get(primary, (255, 255, 255)),
-                    2,
-                )
-                if pose_result.get("keypoints_xy"):
+                render_overlay = should_render_overlay(obs.global_id, seat_id=seat_id)
+                if render_overlay:
+                    display_name = student_metadata_row(obs.global_id).get("display_name", obs.global_id)
+                    label_parts = [display_name]
+                    if seat_id:
+                        label_parts.append(seat_id)
+                    label_parts.append(primary)
+                    label_parts.append(f"{confidence:.2f}")
+                    draw_labeled_box(
+                        frame,
+                        ref_box,
+                        " | ".join(label_parts),
+                        color_map.get(primary, (255, 255, 255)),
+                        2,
+                    )
+                if (
+                    render_overlay
+                    and pose_result.get("keypoints_xy")
+                    and (not str(obs.global_id).startswith("TEMP_") or confidence >= 0.55)
+                ):
                     draw_pose_skeleton(
                         frame,
                         np.asarray(pose_result.get("keypoints_xy"), dtype=np.float32),
@@ -913,6 +987,10 @@ def run_pipeline(args):
         fieldnames = [
             "record_type",
             "person_id",
+            "display_name",
+            "student_name",
+            "roll_number",
+            "student_key",
             "track_id",
             "seat_id",
             "seat_rank",
@@ -949,10 +1027,15 @@ def run_pipeline(args):
             dominant_activity, dominant_frames = max(record.counts.items(), key=lambda item: item[1])
             proof_link = record.proof_links.get(dominant_activity, "")
             seat_info = seating_summary.get(person_id, {})
+            meta = student_metadata_row(person_id)
             writer.writerow(
                 {
                     "record_type": "summary",
                     "person_id": person_id,
+                    "display_name": meta.get("display_name", ""),
+                    "student_name": meta.get("student_name", ""),
+                    "roll_number": meta.get("roll_number", ""),
+                    "student_key": meta.get("student_key", ""),
                     "track_id": record.track_id,
                     "seat_id": seat_info.get("seat_id") or "",
                     "seat_rank": seat_info.get("seat_rank") or "",
@@ -982,10 +1065,15 @@ def run_pipeline(args):
             if row["person_id"] not in reportable_person_ids:
                 continue
             seat_info = seating_summary.get(row["person_id"], {})
+            meta = student_metadata_row(row["person_id"])
             writer.writerow(
                 {
                     "record_type": row["record_type"],
                     "person_id": row["person_id"],
+                    "display_name": meta.get("display_name", ""),
+                    "student_name": meta.get("student_name", ""),
+                    "roll_number": meta.get("roll_number", ""),
+                    "student_key": meta.get("student_key", ""),
                     "track_id": row["track_id"],
                     "seat_id": row.get("seat_id", ""),
                     "seat_rank": seat_info.get("seat_rank") or "",
@@ -1006,12 +1094,20 @@ def run_pipeline(args):
                 }
             )
 
-    device_rows = [row for row in _signal_rows("electronics", records, interval_rows, seating_summary, fps_out) if row.get("person_id", "") in reportable_person_ids]
+    device_rows = [
+        row
+        for row in _signal_rows("electronics", records, interval_rows, seating_summary, student_metadata_map, fps_out)
+        if row.get("person_id", "") in reportable_person_ids
+    ]
     _write_dict_rows(
         activity_csv_path.parent / "device_use.csv",
         [
             "record_type",
             "person_id",
+            "display_name",
+            "student_name",
+            "roll_number",
+            "student_key",
             "track_id",
             "seat_id",
             "seat_rank",
@@ -1031,12 +1127,20 @@ def run_pipeline(args):
         ],
         device_rows,
     )
-    note_rows = [row for row in _signal_rows("note-taking", records, interval_rows, seating_summary, fps_out) if row.get("person_id", "") in reportable_person_ids]
+    note_rows = [
+        row
+        for row in _signal_rows("note-taking", records, interval_rows, seating_summary, student_metadata_map, fps_out)
+        if row.get("person_id", "") in reportable_person_ids
+    ]
     _write_dict_rows(
         activity_csv_path.parent / "note_taking.csv",
         [
             "record_type",
             "person_id",
+            "display_name",
+            "student_name",
+            "roll_number",
+            "student_key",
             "track_id",
             "seat_id",
             "seat_rank",

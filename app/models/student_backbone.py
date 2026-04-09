@@ -43,10 +43,39 @@ def has_named_identity(metadata: Optional[dict[str, Any]] = None) -> bool:
     return bool(student_key or student_name)
 
 
+def student_metadata_fields(metadata: Optional[dict[str, Any]] = None) -> dict[str, str]:
+    metadata = metadata or {}
+    return {
+        "student_name": str(metadata.get("name", "") or "").strip(),
+        "roll_number": str(metadata.get("roll_number", "") or "").strip(),
+        "student_key": str(metadata.get("student_key", "") or "").strip(),
+    }
+
+
 def format_student_global_id(track_id: int, metadata: Optional[dict[str, Any]] = None) -> str:
     if int(track_id) > 0 and has_named_identity(metadata):
         return f"STU_{int(track_id):03d}"
     return f"TEMP_{abs(int(track_id)):04d}"
+
+
+def format_student_display_name(
+    track_id: int,
+    metadata: Optional[dict[str, Any]] = None,
+    *,
+    include_roll: bool = False,
+    unknown_label: str = "Unknown",
+) -> str:
+    fields = student_metadata_fields(metadata)
+    name = fields["student_name"]
+    roll_number = fields["roll_number"]
+    student_key = fields["student_key"]
+    if name and include_roll and roll_number:
+        return f"{name}-{roll_number}"
+    if name:
+        return name
+    if student_key:
+        return student_key
+    return unknown_label
 
 
 def seat_anchor_point(

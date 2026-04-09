@@ -13,7 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.models.student_backbone import format_student_global_id
+from app.models.student_backbone import format_student_display_name, format_student_global_id
 from detectors.vsd_detector.common import (
     TrackClipBuffer,
     draw_lip_box,
@@ -73,13 +73,15 @@ def draw_overlay(frame, track, speech_prob: Optional[float], threshold: float) -
     color = COLOR_FROM_ID(track.track_id)
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
     draw_lip_box(frame, track.bbox, color)
-    global_id = format_student_global_id(track.track_id, getattr(track, "metadata", None))
+    metadata = getattr(track, "metadata", None)
+    global_id = format_student_global_id(track.track_id, metadata)
+    display_name = format_student_display_name(track.track_id, metadata)
 
     if speech_prob is None:
-        label = f"{global_id} | warming"
+        label = f"{display_name} | warming"
     else:
         status = "talking" if speech_prob >= threshold else "silent"
-        label = f"{global_id} | {status} {speech_prob:.2f}"
+        label = f"{display_name} | {status} {speech_prob:.2f}"
 
     (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
     y_top = max(0, y1 - th - 8)
@@ -169,7 +171,9 @@ def main() -> None:
         os.makedirs(os.path.dirname(args.csv) or ".", exist_ok=True)
         csv_file = open(args.csv, "w", newline="", encoding="utf-8")
         csv_writer = csv.writer(csv_file)
-        csv_writer.writerow(["frame_idx", "global_id", "track_id", "speech_prob", "is_speaking"])
+        csv_writer.writerow(
+            ["frame_idx", "global_id", "display_name", "track_id", "speech_prob", "is_speaking"]
+        )
 
     track_scores: Dict[int, float] = {}
     frame_idx = 0
@@ -220,10 +224,12 @@ def main() -> None:
                 draw_overlay(frame, track, score, args.speech_thresh)
 
                 if csv_writer is not None and score is not None:
+                    metadata = getattr(track, "metadata", None)
                     csv_writer.writerow(
                         [
                             frame_idx,
-                            format_student_global_id(track.track_id, getattr(track, "metadata", None)),
+                            format_student_global_id(track.track_id, metadata),
+                            format_student_display_name(track.track_id, metadata),
                             track.track_id,
                             f"{score:.5f}",
                             int(score >= args.speech_thresh),

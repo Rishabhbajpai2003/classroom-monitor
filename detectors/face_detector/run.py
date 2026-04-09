@@ -1434,7 +1434,19 @@ class CsvLogger:
             self.file = open(csv_path, "w", newline="", encoding="utf-8")
             self.writer = csv.writer(self.file)
             self.writer.writerow([
-                "frame_idx", "student_id", "x1", "y1", "x2", "y2", "hits", "first_frame_idx", "last_frame_idx"
+                "frame_idx",
+                "student_id",
+                "display_name",
+                "student_name",
+                "roll_number",
+                "student_key",
+                "x1",
+                "y1",
+                "x2",
+                "y2",
+                "hits",
+                "first_frame_idx",
+                "last_frame_idx",
             ])
 
     def log(self, frame_idx: int, tracks: List[Track]) -> None:
@@ -1443,8 +1455,19 @@ class CsvLogger:
         for t in tracks:
             x1, y1, x2, y2 = t.bbox.tolist()
             self.writer.writerow([
-                frame_idx, t.track_id, f"{x1:.2f}", f"{y1:.2f}", f"{x2:.2f}", f"{y2:.2f}",
-                t.hits, t.first_frame_idx, t.last_frame_idx
+                frame_idx,
+                t.track_id,
+                "",
+                "",
+                "",
+                "",
+                f"{x1:.2f}",
+                f"{y1:.2f}",
+                f"{x2:.2f}",
+                f"{y2:.2f}",
+                t.hits,
+                t.first_frame_idx,
+                t.last_frame_idx,
             ])
 
     def log_annotations(self, frame_idx: int, annotations: List[Dict[str, object]]) -> None:
@@ -1455,9 +1478,15 @@ class CsvLogger:
             if len(bbox) != 4:
                 continue
             x1, y1, x2, y2 = bbox
+            metadata = dict(item.get("metadata") or {})
+            display_name = str(metadata.get("name", "") or "").strip() or "Unknown"
             self.writer.writerow([
                 frame_idx,
                 int(item.get("student_id", 0)),
+                display_name,
+                str(metadata.get("name", "") or "").strip(),
+                str(metadata.get("roll_number", "") or "").strip(),
+                str(metadata.get("student_key", "") or "").strip(),
                 f"{x1:.2f}",
                 f"{y1:.2f}",
                 f"{x2:.2f}",

@@ -25,7 +25,13 @@ from app.models.seat_map import (
     save_seat_map_json,
     save_seat_map_png,
 )
-from app.models.student_backbone import SharedStudentBackbone, StudentObservation, seat_anchor_point
+from app.models.student_backbone import (
+    SharedStudentBackbone,
+    StudentObservation,
+    format_student_display_name,
+    seat_anchor_point,
+    student_metadata_fields,
+)
 from detectors.attention_detector.attention_engine import AttentionEngine
 
 logger = logging.getLogger(__name__)
@@ -56,6 +62,10 @@ class ClassroomProcessor:
         self.report_min_unnamed_frames = int(sys_cfg.get("report_min_track_frames_unnamed", 60))
         self.report_min_unnamed_presence_seconds = float(
             sys_cfg.get("report_min_presence_seconds_unnamed", 8.0)
+        )
+        self.overlay_min_unnamed_frames = int(sys_cfg.get("overlay_min_track_frames_unnamed", 24))
+        self.overlay_min_unnamed_presence_seconds = float(
+            sys_cfg.get("overlay_min_presence_seconds_unnamed", 3.0)
         )
 
         self.phone_object_fps = float(att_cfg.get("phone_object_fps", 2.0))
@@ -89,6 +99,7 @@ class ClassroomProcessor:
 
         self._cached_pose: dict[int, tuple[int, dict]] = {}
         self._cached_phone_detections: tuple[int, list[dict]] = (-10**9, [])
+        self._student_metadata: dict[str, dict[str, str]] = {}
 
     @staticmethod
     def _cadence_frames(video_fps: float, target_fps: float) -> int:
@@ -243,6 +254,7 @@ class ClassroomProcessor:
         for obs in observations:
             seat_id = seat_assignments.get(obs.global_id)
             seat_state = seat_states.get(obs.global_id, "unassigned")
+            self._remember_student_metadata(obs)
             self.attendance_manager.update(obs.global_id, obs.track_id, frame_idx, fps)
             pose_result = self._get_pose_result(obs.track_id, frame_idx, pose_every)
             phone_match = self._match_phone_evidence(obs, phone_detections)
@@ -268,7 +280,8 @@ class ClassroomProcessor:
                 "size_mode": obs.size_mode,
             }
             attention = self.attention_engine.update(obs.global_id, signals)
-            frame = self._draw_annotations(frame, obs, attention, pose_result, phone_match, seat_id, seat_state)
+            if self._should_render_student_overlay(obs.global_id, seat_id=seat_id):
+                frame = self._draw_annotations(frame, obs, attention, pose_result, phone_match, seat_id, seat_state)
 
         if projection is not None:
             frame = self._draw_seat_overlay(frame, projection, seat_assignments)
@@ -307,6 +320,37 @@ class ClassroomProcessor:
     @staticmethod
     def _reference_bbox(obs: StudentObservation) -> list[float]:
         return list(obs.body_bbox if obs.body_bbox is not None else obs.face_bbox)
+
+    def _remember_student_metadata(self, obs: StudentObservation) -> None:
+        metadata = getattr(obs.face_track, "metadata", None) if obs.face_track is not None else None
+        fields = student_metadata_fields(metadata)
+        fields["display_name"] = format_student_display_name(obs.track_id, metadata)
+        self._student_metadata[obs.global_id] = fields
+
+    def _student_metadata_row(self, student_id: str) -> dict[str, str]:
+        return dict(
+            self._student_metadata.get(
+                student_id,
+                {
+                    "student_name": "",
+                    "roll_number": "",
+                    "student_key": "",
+                    "display_name": "Unknown" if str(student_id).startswith("TEMP_") else str(student_id),
+                },
+            )
+        )
+
+    def _should_render_student_overlay(self, student_id: str, seat_id: str | None = None) -> bool:
+        if not str(student_id).startswith("TEMP_"):
+            return True
+        record = self.attendance_manager.records.get(student_id)
+        if record is None:
+            return False
+        return (
+            record.total_visible_frames >= self.overlay_min_unnamed_frames
+            and record.presence_seconds >= self.overlay_min_unnamed_presence_seconds
+            and bool(seat_id)
+        )
 
     def _match_phone_evidence(self, obs: StudentObservation, phone_detections: list[dict]) -> dict:
         if not phone_detections:
@@ -376,13 +420,16 @@ class ClassroomProcessor:
             color = (0, 64, 255)
 
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-        seat_text = seat_id or "--"
-        label = f"{obs.global_id} {seat_text} | {state.upper()} {attention['attention_confidence']:.2f}"
-        sublabel = f"{attention['attention_mode']} | {seat_state}"
+        display_name = self._student_metadata_row(obs.global_id).get("display_name", obs.global_id)
+        label_parts = [display_name]
+        if seat_id:
+            label_parts.append(seat_id)
+        label_parts.append(state.upper())
+        label_parts.append(f"{attention['attention_confidence']:.2f}")
+        label = " | ".join(label_parts)
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
         cv2.rectangle(frame, (x1, max(0, y1 - th - 18)), (x1 + tw + 6, y1), color, -1)
         cv2.putText(frame, label, (x1 + 3, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
-        cv2.putText(frame, sublabel, (x1, min(frame.shape[0] - 6, y2 + 16)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
 
         if obs.body_bbox is None:
             fx1, fy1, fx2, fy2 = [int(round(v)) for v in obs.face_bbox]
@@ -451,11 +498,16 @@ class ClassroomProcessor:
         for record in self.attendance_manager.get_attendance_report():
             if record["global_id"] not in reportable:
                 continue
+            meta = self._student_metadata_row(record["global_id"])
             rows.append(
                 {
                     "session_id": self.session_id,
                     "camera_id": self.camera_id,
                     "global_student_id": record["global_id"],
+                    "display_name": meta.get("display_name", ""),
+                    "student_name": meta.get("student_name", ""),
+                    "roll_number": meta.get("roll_number", ""),
+                    "student_key": meta.get("student_key", ""),
                     "local_track_id": record["local_track_id"],
                     "total_frames": record["total_frames"],
                     "presence_time_seconds": record["presence_time_seconds"],
@@ -470,6 +522,10 @@ class ClassroomProcessor:
                 "session_id",
                 "camera_id",
                 "global_student_id",
+                "display_name",
+                "student_name",
+                "roll_number",
+                "student_key",
                 "local_track_id",
                 "total_frames",
                 "presence_time_seconds",
@@ -486,9 +542,14 @@ class ClassroomProcessor:
         for student_id, metrics in sorted(self.attention_engine.get_all_metrics().items()):
             if student_id not in reportable:
                 continue
+            meta = self._student_metadata_row(student_id)
             rows.append(
                 {
                     "global_student_id": student_id,
+                    "display_name": meta.get("display_name", ""),
+                    "student_name": meta.get("student_name", ""),
+                    "roll_number": meta.get("roll_number", ""),
+                    "student_key": meta.get("student_key", ""),
                     "attention_state": metrics.get("attention_state", "unknown"),
                     "attention_confidence": metrics.get("attention_confidence", 0.0),
                     "attention_mode": metrics.get("attention_mode", "limited"),
@@ -506,6 +567,10 @@ class ClassroomProcessor:
             csv_path,
             [
                 "global_student_id",
+                "display_name",
+                "student_name",
+                "roll_number",
+                "student_key",
                 "attention_state",
                 "attention_confidence",
                 "attention_mode",
@@ -535,6 +600,10 @@ class ClassroomProcessor:
                     "Session_ID",
                     "Camera_ID",
                     "Global_Student_ID",
+                    "Display_Name",
+                    "Student_Name",
+                    "Roll_Number",
+                    "Student_Key",
                     "Local_Track_ID",
                     "Total_Frames",
                     "Presence_Time_Seconds",
@@ -583,11 +652,16 @@ class ClassroomProcessor:
                 )
                 seat_info = seating_summary.get(student_id, {})
                 hand_info = hand_raise_summary.get(student_id, {"hand_raise_count": 0, "hand_raise_seconds": 0.0})
+                meta = self._student_metadata_row(student_id)
                 writer.writerow(
                     [
                         self.session_id,
                         self.camera_id,
                         student_id,
+                        meta.get("display_name", ""),
+                        meta.get("student_name", ""),
+                        meta.get("roll_number", ""),
+                        meta.get("student_key", ""),
                         record["local_track_id"],
                         record["total_frames"],
                         record["presence_time_seconds"],
@@ -918,6 +992,8 @@ class ClassroomProcessor:
             avg_attention = 0.0
             avg_unknown = 0.0
 
+        reportable_ids = self._reportable_student_ids()
+        named_count = sum(1 for student_id in reportable_ids if not str(student_id).startswith("TEMP_"))
         processing_fps = total_frames / processing_time if processing_time > 0 else 0.0
         print(f"\n{'=' * 60}")
         print("  SESSION SUMMARY")
@@ -930,6 +1006,8 @@ class ClassroomProcessor:
         print(f"  Processing Time : {processing_time:.1f}s")
         print(f"  Processing FPS  : {processing_fps:.1f}")
         print(f"  Students Tracked: {attendance_summary['total_students']}")
+        print(f"  Reportable IDs  : {len(reportable_ids)}")
+        print(f"  Named Students  : {named_count}")
         print(f"  Present         : {attendance_summary['present_count']}")
         print(f"  Avg Attention   : {avg_attention:.1f}%")
         print(f"  Avg Unknown     : {avg_unknown:.1f}%")
