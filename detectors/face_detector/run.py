@@ -500,6 +500,7 @@ class FaceTracker:
         continuity_dist_gate: float = 0.32,
         continuity_relax: float = 0.10,
         continuity_bonus: float = 0.12,
+        strong_named_match_score: float = 0.72,
         allow_new_persistent_identities: bool = True,
     ) -> None:
         self.sim_thresh = sim_thresh
@@ -523,6 +524,7 @@ class FaceTracker:
         self.continuity_dist_gate = continuity_dist_gate
         self.continuity_relax = continuity_relax
         self.continuity_bonus = continuity_bonus
+        self.strong_named_match_score = max(float(strong_named_match_score), float(self.reid_sim_thresh))
         self.allow_new_persistent_identities = bool(allow_new_persistent_identities)
 
         self.next_track_id = 1
@@ -576,6 +578,15 @@ class FaceTracker:
                 continue
             if not target_metadata.get(key):
                 target_metadata[key] = value
+
+    @staticmethod
+    def _track_has_named_identity(track: Optional[Track]) -> bool:
+        if track is None:
+            return False
+        metadata = dict(track.metadata or {})
+        student_name = str(metadata.get("name", "") or "").strip()
+        student_key = str(metadata.get("student_key", "") or "").strip()
+        return bool(student_name or student_key)
 
     @staticmethod
     def _detection_sample_metadata(det: Detection, frame_idx: int) -> Dict[str, object]:
@@ -990,12 +1001,24 @@ class FaceTracker:
                 continue
 
             best_score, best_track_id, best_source, margin = self._best_identity_candidate_for_track(probe, frame_idx)
-            if best_track_id is not None and best_score > -1e8 and margin >= self.provisional_match_margin:
+            if best_track_id is not None and best_score > -1e8:
+                target_track: Optional[Track] = None
                 if best_source == "archived":
-                    self._merge_track_into_archived_identity(provisional_id, best_track_id, frame_idx)
+                    target_track = self.archived_tracks.get(best_track_id)
                 elif best_source == "active":
-                    self._merge_track_into_active_identity(provisional_id, best_track_id, frame_idx)
-                continue
+                    target_track = self.tracks.get(best_track_id)
+
+                strong_named_match = (
+                    self._track_has_named_identity(target_track)
+                    and probe.hits >= self.min_confirm_hits
+                    and best_score >= self.strong_named_match_score
+                )
+                if margin >= self.provisional_match_margin or strong_named_match:
+                    if best_source == "archived":
+                        self._merge_track_into_archived_identity(provisional_id, best_track_id, frame_idx)
+                    elif best_source == "active":
+                        self._merge_track_into_active_identity(provisional_id, best_track_id, frame_idx)
+                    continue
 
             if not self.allow_new_persistent_identities:
                 continue

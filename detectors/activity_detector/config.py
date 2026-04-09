@@ -56,13 +56,13 @@ def parse_args():
     parser.add_argument("--tile_grid", type=int, default=2, help="Tile grid for person/object detection.")
     parser.add_argument("--tile_overlap", type=float, default=0.20, help="Tile overlap ratio.")
 
-    parser.add_argument("--track_fps", type=float, default=8.0, help="Face/body tracking rate.")
+    parser.add_argument("--track_fps", type=float, default=9.0, help="Face/body tracking rate.")
     parser.add_argument("--object_fps", type=float, default=3.0, help="Object detection rate.")
     parser.add_argument("--pose_fps", type=float, default=2.5, help="Pose refresh rate.")
 
-    parser.add_argument("--face_det_size", type=int, default=1280, help="InsightFace detection size.")
-    parser.add_argument("--face_tile_grid", type=int, default=2, help="InsightFace tile grid.")
-    parser.add_argument("--face_tile_overlap", type=float, default=0.20, help="InsightFace tile overlap.")
+    parser.add_argument("--face_det_size", type=int, default=1600, help="InsightFace detection size.")
+    parser.add_argument("--face_tile_grid", type=int, default=3, help="InsightFace tile grid.")
+    parser.add_argument("--face_tile_overlap", type=float, default=0.22, help="InsightFace tile overlap.")
     parser.add_argument("--min_face", type=int, default=12, help="Minimum face size in pixels.")
     parser.add_argument("--identity_db", default="detectors/face_detector/identity_db.json", help="Persistent face identity DB.")
     parser.add_argument("--identity_db_save_every", type=int, default=150, help="Save identity DB every N frames.")

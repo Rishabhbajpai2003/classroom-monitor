@@ -39,22 +39,36 @@ identity:
   embedding_model: mobilenet_v3_small
 
 student_backbone:
-  face_process_fps: 8.0
-  face_det_size: 1280
-  face_det_thresh: 0.24
-  face_tile_grid: 2
-  face_tile_overlap: 0.20
+  face_process_fps: 9.0
+  face_det_size: 1600
+  face_det_thresh: 0.20
+  face_tile_grid: 3
+  face_tile_overlap: 0.22
   face_min_size: 12
   identity_db_path: detectors/face_detector/identity_db.json
   identity_db_save_every: 150
   ttl: 120
   archive_ttl: 1800
   sim_thresh: 0.45
-  reid_sim_thresh: 0.55
+  iou_weight: 0.22
+  sim_weight: 0.70
+  dist_weight: 0.08
+  reid_sim_thresh: 0.52
+  appearance_weight: 0.16
+  min_face_sim: 0.20
+  merge_sim_thresh: 0.60
+  young_track_hits: 10
   min_confirm_hits: 2
   new_id_confirm_hits: 2
   new_id_confirm_quality: 0.20
+  provisional_match_margin: 0.02
   high_det_score: 0.48
+  continuity_window: 4
+  continuity_iou_gate: 0.16
+  continuity_dist_gate: 0.36
+  continuity_relax: 0.12
+  continuity_bonus: 0.14
+  strong_named_match_score: 0.72
   allow_new_identities: false
   body_memory_frames: 18
   full_min_height: 160
@@ -88,6 +102,7 @@ seating:
   calibration_path: null
   initial_confirm_seconds: 1.0
   shift_confirm_seconds: 10.0
+  seat_stick_seconds: 3.0
 
 attendance_events:
   out_of_class_seconds: 20.0

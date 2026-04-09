@@ -53,6 +53,7 @@ class SeatEventEngine:
         fps: float,
         initial_confirm_seconds: float = 3.0,
         shift_confirm_seconds: float = 10.0,
+        seat_stick_seconds: float = 3.0,
         out_of_class_seconds: float = 20.0,
         exit_zone_seconds: float = 8.0,
         late_arrival_minutes: float = 5.0,
@@ -62,6 +63,7 @@ class SeatEventEngine:
         self.fps = max(1e-6, float(fps))
         self.initial_confirm_frames = max(1, int(round(initial_confirm_seconds * self.fps)))
         self.shift_confirm_frames = max(1, int(round(shift_confirm_seconds * self.fps)))
+        self.seat_stick_frames = max(1, int(round(seat_stick_seconds * self.fps)))
         self.out_of_class_frames = max(1, int(round(out_of_class_seconds * self.fps)))
         self.exit_zone_frames = max(1, int(round(exit_zone_seconds * self.fps)))
         self.late_arrival_frames = max(1, int(round(late_arrival_minutes * 60.0 * self.fps)))
@@ -113,12 +115,32 @@ class SeatEventEngine:
 
         score_matrix = np.full((len(students), len(visible_seats)), -1e9, dtype=np.float32)
         for row_idx, student in enumerate(students):
+            student_id = str(student["global_id"])
             center = np.asarray(student["center"], dtype=np.float32)
+            current_seat = self.current_seat.get(student_id)
+            candidate_seat = self.candidate_seat.get(student_id)
+            last_assignment = self.last_assignment.get(student_id)
+            current_state = self.current_state.get(student_id, "unassigned")
+            current_visible = bool(
+                current_seat
+                and projection.seat_visibility.get(current_seat) == "visible"
+                and projection.seat_points.get(current_seat) is not None
+            )
             for col_idx, seat in enumerate(visible_seats):
                 seat_point = projection.seat_points[seat.seat_id]
                 score = self._seat_distance_score(seat, seat_point, center)
                 if score < -0.35:
                     continue
+                if current_seat and seat.seat_id == current_seat:
+                    score += 0.22
+                    if current_state in {"seated", "unobservable"}:
+                        score += 0.05
+                elif candidate_seat and seat.seat_id == candidate_seat:
+                    score += 0.10
+                elif last_assignment and seat.seat_id == last_assignment:
+                    score += 0.04
+                elif current_visible and current_seat and seat.seat_id != current_seat:
+                    score -= 0.08
                 score_matrix[row_idx, col_idx] = score
 
         matches: dict[str, str] = {}
@@ -314,6 +336,12 @@ class SeatEventEngine:
         if seat_visibility != "visible" or not projection.stable:
             self.visible_empty_start.pop(student_id, None)
             self._set_state(student_id, "unobservable", frame_idx)
+            return
+
+        candidate_start = self.candidate_start.get(student_id)
+        if candidate_start is not None and (frame_idx - candidate_start + 1) < self.seat_stick_frames:
+            self.visible_empty_start.pop(student_id, None)
+            self._set_state(student_id, "seated", frame_idx)
             return
 
         self._set_state(student_id, "seated", frame_idx)

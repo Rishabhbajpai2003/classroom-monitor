@@ -92,6 +92,7 @@ class ClassroomProcessor:
 
         self.initial_confirm_seconds = float(seating_cfg.get("initial_confirm_seconds", 3.0))
         self.shift_confirm_seconds = float(seating_cfg.get("shift_confirm_seconds", 10.0))
+        self.seat_stick_seconds = float(seating_cfg.get("seat_stick_seconds", 3.0))
         self.out_of_class_seconds = float(event_cfg.get("out_of_class_seconds", 20.0))
         self.exit_zone_seconds = float(event_cfg.get("exit_zone_seconds", 8.0))
         self.late_arrival_minutes = float(event_cfg.get("late_arrival_minutes", 5.0))
@@ -128,6 +129,7 @@ class ClassroomProcessor:
             fps=fps,
             initial_confirm_seconds=self.initial_confirm_seconds,
             shift_confirm_seconds=self.shift_confirm_seconds,
+            seat_stick_seconds=self.seat_stick_seconds,
             out_of_class_seconds=self.out_of_class_seconds,
             exit_zone_seconds=self.exit_zone_seconds,
             late_arrival_minutes=self.late_arrival_minutes,

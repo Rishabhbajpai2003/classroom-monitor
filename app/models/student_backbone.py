@@ -227,10 +227,10 @@ class SharedStudentBackbone:
         back_cfg = self.config.get("student_backbone", {})
         self.device = str(sys_cfg.get("device", "auto"))
         self.process_fps = float(back_cfg.get("face_process_fps", 8.0))
-        self.det_size = int(back_cfg.get("face_det_size", 1280))
-        self.det_thresh = float(back_cfg.get("face_det_thresh", 0.24))
-        self.tile_grid = int(back_cfg.get("face_tile_grid", 2))
-        self.tile_overlap = float(back_cfg.get("face_tile_overlap", 0.20))
+        self.det_size = int(back_cfg.get("face_det_size", 1600))
+        self.det_thresh = float(back_cfg.get("face_det_thresh", 0.20))
+        self.tile_grid = int(back_cfg.get("face_tile_grid", 3))
+        self.tile_overlap = float(back_cfg.get("face_tile_overlap", 0.22))
         self.min_face = int(back_cfg.get("face_min_size", 12))
         self.identity_db_path = str(
             back_cfg.get("identity_db_path", "detectors/face_detector/identity_db.json")
@@ -277,13 +277,35 @@ class SharedStudentBackbone:
         )
         self._tracker = FaceTracker(
             sim_thresh=float(self.config.get("student_backbone", {}).get("sim_thresh", 0.45)),
+            iou_weight=float(self.config.get("student_backbone", {}).get("iou_weight", 0.22)),
+            sim_weight=float(self.config.get("student_backbone", {}).get("sim_weight", 0.70)),
+            dist_weight=float(self.config.get("student_backbone", {}).get("dist_weight", 0.08)),
             ttl=int(self.config.get("student_backbone", {}).get("ttl", 120)),
             archive_ttl=int(self.config.get("student_backbone", {}).get("archive_ttl", 1800)),
-            reid_sim_thresh=float(self.config.get("student_backbone", {}).get("reid_sim_thresh", 0.55)),
+            reid_sim_thresh=float(self.config.get("student_backbone", {}).get("reid_sim_thresh", 0.52)),
             min_confirm_hits=int(self.config.get("student_backbone", {}).get("min_confirm_hits", 2)),
+            appearance_weight=float(self.config.get("student_backbone", {}).get("appearance_weight", 0.16)),
+            min_face_sim=float(self.config.get("student_backbone", {}).get("min_face_sim", 0.20)),
+            merge_sim_thresh=float(self.config.get("student_backbone", {}).get("merge_sim_thresh", 0.60)),
+            young_track_hits=int(self.config.get("student_backbone", {}).get("young_track_hits", 10)),
             new_id_confirm_hits=int(self.config.get("student_backbone", {}).get("new_id_confirm_hits", 2)),
             new_id_confirm_quality=float(self.config.get("student_backbone", {}).get("new_id_confirm_quality", 0.20)),
+            provisional_match_margin=float(
+                self.config.get("student_backbone", {}).get("provisional_match_margin", 0.02)
+            ),
             high_det_score=float(self.config.get("student_backbone", {}).get("high_det_score", 0.48)),
+            continuity_window=int(self.config.get("student_backbone", {}).get("continuity_window", 4)),
+            continuity_iou_gate=float(
+                self.config.get("student_backbone", {}).get("continuity_iou_gate", 0.16)
+            ),
+            continuity_dist_gate=float(
+                self.config.get("student_backbone", {}).get("continuity_dist_gate", 0.36)
+            ),
+            continuity_relax=float(self.config.get("student_backbone", {}).get("continuity_relax", 0.12)),
+            continuity_bonus=float(self.config.get("student_backbone", {}).get("continuity_bonus", 0.14)),
+            strong_named_match_score=float(
+                self.config.get("student_backbone", {}).get("strong_named_match_score", 0.72)
+            ),
             allow_new_persistent_identities=bool(
                 self.config.get("student_backbone", {}).get("allow_new_identities", False)
             ),

@@ -132,6 +132,27 @@ class SeatEventTests(unittest.TestCase):
         self.assertIn("out_of_class", event_types)
         self.assertIn("early_exit", event_types)
 
+    def test_current_seat_is_sticky_under_short_ambiguous_motion(self):
+        engine = SeatEventEngine(
+            self.seat_map,
+            fps=1.0,
+            initial_confirm_seconds=1.0,
+            shift_confirm_seconds=2.0,
+            seat_stick_seconds=3.0,
+            out_of_class_seconds=2.0,
+            exit_zone_seconds=2.0,
+            late_arrival_minutes=5.0,
+            early_exit_minutes=5.0,
+        )
+        projection_two = _projection_two()
+        student = {"global_id": "STU_004", "track_id": 4, "center": [100.0, 100.0]}
+        jittered = {"global_id": "STU_004", "track_id": 4, "center": [150.0, 150.0]}
+        engine.update(0, projection_two, [student])
+        engine.update(1, projection_two, [jittered])
+        self.assertEqual(engine.get_current_seat("STU_004"), "R01-S01")
+        event_types = [row["event_type"] for row in engine.get_event_rows()]
+        self.assertNotIn("seat_shift", event_types)
+
 
 if __name__ == "__main__":
     unittest.main()
