@@ -1,17 +1,8 @@
 """
-Main processing pipeline for classroom attention and attendance monitoring.
-
-Integrates:
-    - YOLO26 person detection
-    - DeepSORT tracking with ReID
-    - Face detection and embedding extraction
-    - Pose analysis (hand raise, head forward, phone usage)
-    - Persistent identity matching
-    - Attendance tracking
-    - Confidence-weighted attention scoring
-    - Annotated video output
-    - Structured CSV report generation
+Recall-first classroom attention, attendance, and seat-aware event processor.
 """
+
+from __future__ import annotations
 
 import csv
 import logging
@@ -22,500 +13,575 @@ import cv2
 import numpy as np
 from tqdm import tqdm
 
-from app.models.detectors import PersonDetector
-from app.models.tracker import PersonTracker
-from app.models.pose_analyzer import PoseAnalyzer
-from app.models.face_detector import FaceDetector
-from app.models.identity_manager import IdentityManager
 from app.models.attendance_manager import AttendanceManager
-from attention_engine import AttentionEngine
+from app.models.detectors import OpenVocabularyObjectDetector, PersonDetector, bbox_iou
+from app.models.hand_raise_events import HandRaiseEventTracker
+from app.models.pose_analyzer import PoseAnalyzer
+from app.models.seat_events import SeatEventEngine
+from app.models.seat_map import (
+    CameraMotionCompensator,
+    build_seat_map,
+    load_seat_calibration,
+    save_seat_map_json,
+    save_seat_map_png,
+)
+from app.models.student_backbone import SharedStudentBackbone, StudentObservation
+from detectors.attention_detector.attention_engine import AttentionEngine
 
 logger = logging.getLogger(__name__)
 
 
+def _box_center(box: list[float]) -> np.ndarray:
+    x1, y1, x2, y2 = [float(v) for v in box]
+    return np.asarray([(x1 + x2) * 0.5, (y1 + y2) * 0.5], dtype=np.float32)
+
+
 class ClassroomProcessor:
-    """
-    Production-grade classroom attendance and attention processing pipeline.
-
-    Processes a video through detection → tracking → identity → pose analysis
-    → attention scoring → attendance, producing annotated video and CSV reports.
-
-    Attributes:
-        config: Pipeline configuration dict.
-        camera_id: Camera identifier string.
-        session_id: Unique session identifier.
-        person_detector: YOLO26 person detector.
-        tracker: DeepSORT tracker with ReID.
-        face_detector: Face detector with embedding extraction.
-        pose_analyzer: MediaPipe pose analyzer.
-        identity_manager: Persistent student identity matcher.
-        attendance_manager: Attendance tracker.
-        attention_engine: Confidence-weighted attention scorer.
-    """
-
     def __init__(self, config: dict | None = None):
-        """
-        Initialize the ClassroomProcessor.
-
-        Args:
-            config: Full pipeline configuration dict (from config.yaml).
-        """
         self.config = config or {}
         sys_cfg = self.config.get("system", {})
+        att_cfg = self.config.get("attention", {})
+        seating_cfg = self.config.get("seating", {})
+        event_cfg = self.config.get("attendance_events", {})
 
         self.camera_id = sys_cfg.get("camera_id", "cam_01")
         self.session_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{self.camera_id}"
         self.output_dir = sys_cfg.get("output_dir", "outputs")
-        self.save_video = sys_cfg.get("save_video", True)
-        self.save_csv = sys_cfg.get("save_csv", True)
-        self.headless = sys_cfg.get("headless", False)
-        self.frame_skip = sys_cfg.get("frame_skip", 2)
-        self.pose_skip = sys_cfg.get("pose_skip", 5)
+        self.save_video = bool(sys_cfg.get("save_video", True))
+        self.save_csv = bool(sys_cfg.get("save_csv", True))
+        self.headless = bool(sys_cfg.get("headless", False))
+        self.frame_skip = int(sys_cfg.get("frame_skip", 1))
 
-        logger.info(f"Initializing ClassroomProcessor — Session: {self.session_id}")
+        self.phone_object_fps = float(att_cfg.get("phone_object_fps", 2.0))
+        self.pose_fps = float(att_cfg.get("pose_fps", 3.0))
 
-        # Initialize all pipeline components
         self.person_detector = PersonDetector(self.config)
-        self.tracker = PersonTracker(self.config)
-        self.face_detector = FaceDetector(self.config)
+        self.phone_detector = OpenVocabularyObjectDetector(
+            target_classes=["cell phone", "mobile phone", "smartphone", "phone"],
+            config=self.config,
+            config_section="object_detection",
+        )
         self.pose_analyzer = PoseAnalyzer(self.config)
-        self.identity_manager = IdentityManager(self.config)
+        self.student_backbone = SharedStudentBackbone(self.config)
         self.attendance_manager = AttendanceManager(self.config)
         self.attention_engine = AttentionEngine(self.config)
 
-        # Pose cache per track (to avoid running pose every frame)
-        self._pose_cache: dict[int, dict] = {}
+        self.seat_calibration_path = seating_cfg.get("calibration_path")
+        self._seat_calibration = None
+        self._seat_map = []
+        self._projection_manager = None
+        self._seat_event_engine = None
+        self._hand_raise_tracker = None
+        self._reference_frame = None
 
-        # Track embedding extraction schedule (extract once per track)
-        self._embedding_extracted: set[int] = set()
+        self.initial_confirm_seconds = float(seating_cfg.get("initial_confirm_seconds", 3.0))
+        self.shift_confirm_seconds = float(seating_cfg.get("shift_confirm_seconds", 10.0))
+        self.out_of_class_seconds = float(event_cfg.get("out_of_class_seconds", 20.0))
+        self.exit_zone_seconds = float(event_cfg.get("exit_zone_seconds", 8.0))
+        self.late_arrival_minutes = float(event_cfg.get("late_arrival_minutes", 5.0))
+        self.early_exit_minutes = float(event_cfg.get("early_exit_minutes", 5.0))
 
-        logger.info("All pipeline components initialized successfully.")
+        self._cached_pose: dict[int, tuple[int, dict]] = {}
+        self._cached_phone_detections: tuple[int, list[dict]] = (-10**9, [])
 
-    def process_video(self, video_path: str, output_path: str | None = None):
-        """
-        Process a video through the full pipeline.
+    @staticmethod
+    def _cadence_frames(video_fps: float, target_fps: float) -> int:
+        if target_fps <= 0:
+            return 1
+        return max(1, int(round(float(video_fps) / max(1e-6, float(target_fps)))))
 
-        Args:
-            video_path: Path to input video file.
-            output_path: Path for annotated output video. If None, auto-generated.
-        """
-        # --- Video setup ---
+    def _setup_seat_system(self, video_path: str, fps: float) -> None:
+        if not self.seat_calibration_path:
+            return
+        self._seat_calibration = load_seat_calibration(self.seat_calibration_path)
+        self._seat_map = build_seat_map(self._seat_calibration)
+
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
-            logger.error(f"Cannot open video: {video_path}")
+            raise FileNotFoundError(f"Cannot open video for calibration: {video_path}")
+        cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(self._seat_calibration.reference_frame_index)))
+        ok, reference_frame = cap.read()
+        cap.release()
+        if not ok:
+            raise RuntimeError("Could not read calibration reference frame from video.")
+        self._reference_frame = reference_frame
+        self._projection_manager = CameraMotionCompensator(reference_frame, self._seat_calibration, self._seat_map)
+        self._seat_event_engine = SeatEventEngine(
+            self._seat_map,
+            fps=fps,
+            initial_confirm_seconds=self.initial_confirm_seconds,
+            shift_confirm_seconds=self.shift_confirm_seconds,
+            out_of_class_seconds=self.out_of_class_seconds,
+            exit_zone_seconds=self.exit_zone_seconds,
+            late_arrival_minutes=self.late_arrival_minutes,
+            early_exit_minutes=self.early_exit_minutes,
+        )
+        self._hand_raise_tracker = HandRaiseEventTracker(fps=fps)
+
+    def process_video(self, video_path: str, output_path: str | None = None):
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
             raise FileNotFoundError(f"Cannot open video: {video_path}")
 
         fps = cap.get(cv2.CAP_PROP_FPS)
-        if fps == 0 or fps is None:
+        if fps <= 0:
             fps = 30.0
-            logger.warning(f"Could not read FPS, defaulting to {fps}")
-
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        ret, first_frame = cap.read()
-        if not ret:
-            logger.error("Cannot read first frame.")
+
+        ok, first_frame = cap.read()
+        if not ok:
             cap.release()
             raise RuntimeError("Cannot read first frame.")
-
-        h, w = first_frame.shape[:2]
+        height, width = first_frame.shape[:2]
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
-        logger.info(
-            f"Video: {video_path} | {w}x{h} @ {fps:.1f} FPS | "
-            f"{total_frames} frames | Camera: {self.camera_id}"
-        )
+        if self.seat_calibration_path:
+            self._setup_seat_system(video_path, fps)
 
-        # --- Video writer setup ---
         os.makedirs(self.output_dir, exist_ok=True)
-        out_writer = None
+        writer = None
         if self.save_video:
             if output_path is None:
                 output_path = os.path.join(self.output_dir, "output.avi")
-            fourcc = cv2.VideoWriter_fourcc(*"MJPG")
-            out_writer = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
-            logger.info(f"Output video: {output_path}")
+            writer = cv2.VideoWriter(
+                output_path,
+                cv2.VideoWriter_fourcc(*"MJPG"),
+                fps,
+                (width, height),
+            )
 
-        # --- Processing loop ---
-        frame_count = 0
         processing_start = datetime.now()
-
-        print(f"\n{'='*60}")
-        print(f"  Classroom Monitoring Pipeline — Session: {self.session_id}")
-        print(f"  Video: {video_path}")
-        print(f"  Camera: {self.camera_id}")
-        print(f"  Total frames: {total_frames}")
-        print(f"{'='*60}\n")
+        pose_every = self._cadence_frames(fps, self.pose_fps)
+        phone_every = self._cadence_frames(fps, self.phone_object_fps)
+        frame_idx = 0
 
         try:
-            with tqdm(total=total_frames, desc="Processing", unit="frame",
-                       ncols=100) as pbar:
-
+            with tqdm(total=total_frames, desc="Processing", unit="frame", ncols=100) as progress:
                 while True:
-                    ret, frame = cap.read()
-                    if not ret:
+                    ok, frame = cap.read()
+                    if not ok:
                         break
-
-                    frame_count += 1
-
-                    # Frame skip optimization
-                    if frame_count % self.frame_skip != 0:
-                        if out_writer:
-                            out_writer.write(frame)
-                        pbar.update(1)
+                    frame_idx += 1
+                    if self.frame_skip > 1 and frame_idx % self.frame_skip != 0:
+                        if writer is not None:
+                            writer.write(frame)
+                        progress.update(1)
                         continue
 
-                    # Process this frame
-                    annotated_frame = self._process_frame(
-                        frame, frame_count, fps
-                    )
-
-                    if out_writer:
-                        out_writer.write(annotated_frame)
-
-                    pbar.update(1)
-
-        except KeyboardInterrupt:
-            logger.warning("Processing interrupted by user.")
-        except Exception as e:
-            logger.error(f"Processing error at frame {frame_count}: {e}")
-            raise
+                    annotated = self._process_frame(frame, frame_idx, fps, pose_every, phone_every)
+                    if writer is not None:
+                        writer.write(annotated)
+                    progress.update(1)
         finally:
             cap.release()
-            if out_writer:
-                out_writer.release()
-            logger.info("Video resources released.")
+            if writer is not None:
+                writer.release()
+            self.student_backbone.close()
+
+        if self._seat_event_engine is not None:
+            self._seat_event_engine.finalize(frame_idx)
+        if self._hand_raise_tracker is not None:
+            self._hand_raise_tracker.finalize(frame_idx)
 
         processing_time = (datetime.now() - processing_start).total_seconds()
-
-        # --- Generate outputs ---
         if self.save_csv:
-            csv_path = os.path.join(self.output_dir, "attendance_report.csv")
-            self._save_attendance_report(csv_path)
+            self._save_outputs()
+        self._print_session_summary(video_path, frame_idx, processing_time, fps)
 
-        # --- Print session summary ---
-        self._print_session_summary(
-            video_path, frame_count, processing_time, fps
-        )
+    def _process_frame(
+        self,
+        frame: np.ndarray,
+        frame_idx: int,
+        fps: float,
+        pose_every: int,
+        phone_every: int,
+    ) -> np.ndarray:
+        body_detections = self.person_detector.detect(frame)
+        observations = self.student_backbone.step(frame, frame_idx, fps, body_detections=body_detections)
 
-    def _process_frame(self, frame: np.ndarray, frame_idx: int,
-                       fps: float) -> np.ndarray:
-        """
-        Process a single frame through the full pipeline.
-
-        Args:
-            frame: BGR frame (numpy array).
-            frame_idx: Current frame index.
-            fps: Video FPS.
-
-        Returns:
-            Annotated frame with bounding boxes and status labels.
-        """
-        # 1. Person detection (YOLO26)
-        detections = self.person_detector.detect(frame)
-
-        # 2. Format detections for DeepSORT: ([x, y, w, h], confidence, class)
-        tracker_dets = []
-        det_confidence_map = {}
-
-        for i, det in enumerate(detections):
-            x1, y1, x2, y2 = det["bbox"]
-            w_box = x2 - x1
-            h_box = y2 - y1
-            conf = det["confidence"]
-            tracker_dets.append(
-                ([float(x1), float(y1), float(w_box), float(h_box)],
-                 conf, "person")
-            )
-            det_confidence_map[i] = conf
-
-        # 3. Update tracker
-        tracks = self.tracker.update(tracker_dets, frame)
-
-        # 4. Collect all confirmed tracks first (for batch pose)
-        confirmed_tracks = []
-        for track in tracks:
-            if not track.is_confirmed():
-                continue
-
-            track_id = track.track_id
-            l, t, r, b = track.to_ltrb()
-            person_bbox = [l, t, r, b]
-
-            det_conf = self._get_track_detection_confidence(
-                person_bbox, detections
-            )
-
-            # Identity matching (once per track)
-            if track_id not in self._embedding_extracted:
-                embedding = self.face_detector.extract_embedding(
-                    frame, person_bbox
+        seat_assignments: dict[str, str | None] = {}
+        seat_states: dict[str, str] = {}
+        projection = None
+        if self._projection_manager is not None and self._seat_event_engine is not None:
+            projection = self._projection_manager.project(frame, frame_idx)
+            seat_students = []
+            for obs in observations:
+                ref_box = self._reference_bbox(obs)
+                seat_students.append(
+                    {
+                        "global_id": obs.global_id,
+                        "track_id": obs.track_id,
+                        "center": _box_center(ref_box).tolist(),
+                    }
                 )
-                timestamp = datetime.now().isoformat()
-                global_id = self.identity_manager.get_global_id_for_track(
-                    track_id, embedding, timestamp
+            seat_assignments = self._seat_event_engine.update(frame_idx, projection, seat_students)
+            seat_states = {
+                obs.global_id: self._seat_event_engine.get_current_state(obs.global_id)
+                for obs in observations
+            }
+
+        if frame_idx % phone_every == 0:
+            self._cached_phone_detections = (frame_idx, self.phone_detector.detect(frame))
+        phone_detections = self._cached_phone_detections[1]
+
+        pose_targets = [
+            {"track_id": obs.track_id, "bbox": obs.body_bbox}
+            for obs in observations
+            if obs.body_bbox is not None and obs.size_mode != "limited"
+        ]
+        if pose_targets and frame_idx % pose_every == 0:
+            pose_results = self.pose_analyzer.analyze_batch(frame, pose_targets)
+            for track_id, pose_result in pose_results.items():
+                self._cached_pose[int(track_id)] = (frame_idx, pose_result)
+
+        for obs in observations:
+            seat_id = seat_assignments.get(obs.global_id)
+            seat_state = seat_states.get(obs.global_id, "unassigned")
+            self.attendance_manager.update(obs.global_id, obs.track_id, frame_idx, fps)
+            pose_result = self._get_pose_result(obs.track_id, frame_idx, pose_every)
+            phone_match = self._match_phone_evidence(obs, phone_detections)
+
+            if self._hand_raise_tracker is not None:
+                self._hand_raise_tracker.update(
+                    obs.global_id,
+                    obs.track_id,
+                    frame_idx,
+                    bool(pose_result.get("hand_raised", False)),
+                    float(pose_result.get("pose_confidence", 0.0)),
+                    seat_id or "",
                 )
-                self._embedding_extracted.add(track_id)
-            else:
-                global_id = self.identity_manager.get_global_id_for_track(
-                    track_id
-                )
-
-            # Attendance update
-            self.attendance_manager.update(
-                global_id, track_id, frame_idx, fps
-            )
-
-            confirmed_tracks.append({
-                "track_id": track_id,
-                "bbox": person_bbox,
-                "det_conf": det_conf,
-                "global_id": global_id,
-            })
-
-        # 5. Batch pose analysis — ONE YOLO inference for ALL persons
-        if frame_idx % self.pose_skip == 0 and confirmed_tracks:
-            pose_results = self.pose_analyzer.analyze_batch(
-                frame,
-                [{"track_id": t["track_id"], "bbox": t["bbox"]}
-                 for t in confirmed_tracks],
-            )
-            # Update cache
-            for tid, result in pose_results.items():
-                self._pose_cache[tid] = result
-
-        # 6. Attention scoring + annotation for each person
-        for info in confirmed_tracks:
-            track_id = info["track_id"]
-            person_bbox = info["bbox"]
-            global_id = info["global_id"]
-            det_conf = info["det_conf"]
-
-            pose_result = self._pose_cache.get(track_id, {
-                "hand_raised": False,
-                "head_forward": False,
-                "using_phone": False,
-                "pose_confidence": 0.0,
-            })
 
             signals = {
-                "hand_raised": pose_result["hand_raised"],
-                "head_forward": pose_result["head_forward"],
-                "using_phone": pose_result["using_phone"],
-                "pose_confidence": pose_result["pose_confidence"],
-                "detection_confidence": det_conf,
+                "hand_raised": pose_result.get("hand_raised", False),
+                "head_forward": pose_result.get("head_forward", False),
+                "using_phone_pose": pose_result.get("using_phone_pose", False),
+                "using_phone_object": phone_match["matched"],
+                "phone_object_confidence": phone_match["confidence"],
+                "pose_confidence": pose_result.get("pose_confidence", 0.0),
+                "detection_confidence": max(obs.detection_confidence, obs.face_confidence),
+                "size_mode": obs.size_mode,
             }
-            attention_status = self.attention_engine.update(global_id, signals)
+            attention = self.attention_engine.update(obs.global_id, signals)
+            frame = self._draw_annotations(frame, obs, attention, pose_result, phone_match, seat_id, seat_state)
 
-            frame = self._draw_annotations(
-                frame, person_bbox, track_id, global_id,
-                attention_status, pose_result, det_conf
-            )
-
+        if projection is not None:
+            frame = self._draw_seat_overlay(frame, projection, seat_assignments)
         return frame
 
-    def _get_track_detection_confidence(
-        self, track_bbox: list, detections: list[dict]
-    ) -> float:
-        """
-        Find the detection confidence that best matches a track's bbox
-        using IoU overlap.
-        """
-        if not detections:
-            return 0.5
-
-        best_iou = 0.0
-        best_conf = 0.5
-
-        tl, tt, tr, tb = track_bbox
-
-        for det in detections:
-            dl, dt, dr, db = det["bbox"]
-
-            # Compute IoU
-            inter_l = max(tl, dl)
-            inter_t = max(tt, dt)
-            inter_r = min(tr, dr)
-            inter_b = min(tb, db)
-
-            if inter_r <= inter_l or inter_b <= inter_t:
+    def _draw_seat_overlay(self, frame: np.ndarray, projection, seat_assignments: dict[str, str | None]) -> np.ndarray:
+        occupied = {seat_id for seat_id in seat_assignments.values() if seat_id}
+        for seat in self._seat_map:
+            point = projection.seat_points.get(seat.seat_id)
+            visibility = projection.seat_visibility.get(seat.seat_id, "unstable_view")
+            if point is None:
                 continue
+            center = tuple(int(round(v)) for v in point)
+            color = (0, 220, 0)
+            if visibility == "off_frame":
+                color = (120, 120, 120)
+            elif visibility == "unstable_view":
+                color = (0, 165, 255)
+            elif seat.seat_id in occupied:
+                color = (255, 180, 0)
+            cv2.circle(frame, center, 4, color, -1, cv2.LINE_AA)
+            cv2.putText(frame, seat.seat_id, (center[0] + 4, center[1] - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.38, color, 1, cv2.LINE_AA)
+        if projection.exit_polygon:
+            polygon = np.asarray(projection.exit_polygon, dtype=np.int32).reshape((-1, 1, 2))
+            cv2.polylines(frame, [polygon], True, (0, 0, 255), 2, cv2.LINE_AA)
+        return frame
 
-            inter_area = (inter_r - inter_l) * (inter_b - inter_t)
-            track_area = max(0, (tr - tl) * (tb - tt))
-            det_area = max(0, (dr - dl) * (db - dt))
-            union = track_area + det_area - inter_area
+    def _get_pose_result(self, track_id: int, frame_idx: int, pose_every: int) -> dict:
+        cached = self._cached_pose.get(int(track_id))
+        if cached is None:
+            return self.pose_analyzer._default_result()
+        if frame_idx - int(cached[0]) > max(2, pose_every * 2):
+            return self.pose_analyzer._default_result()
+        return cached[1]
 
-            if union > 0:
-                iou = inter_area / union
-                if iou > best_iou:
-                    best_iou = iou
-                    best_conf = det["confidence"]
+    @staticmethod
+    def _reference_bbox(obs: StudentObservation) -> list[float]:
+        return list(obs.body_bbox if obs.body_bbox is not None else obs.face_bbox)
 
-        return best_conf
+    def _match_phone_evidence(self, obs: StudentObservation, phone_detections: list[dict]) -> dict:
+        if not phone_detections:
+            return {"matched": False, "confidence": 0.0, "bbox": None}
+
+        ref_box = self._reference_bbox(obs)
+        rx1, ry1, rx2, ry2 = [float(v) for v in ref_box]
+        ref_w = max(1.0, rx2 - rx1)
+        ref_h = max(1.0, ry2 - ry1)
+        ref_cx = 0.5 * (rx1 + rx2)
+        ref_cy = 0.5 * (ry1 + ry2)
+
+        face_x1, face_y1, face_x2, face_y2 = [float(v) for v in obs.face_bbox]
+        face_size = max(1.0, max(face_x2 - face_x1, face_y2 - face_y1))
+        face_cx = 0.5 * (face_x1 + face_x2)
+        face_cy = 0.5 * (face_y1 + face_y2)
+
+        best = {"matched": False, "confidence": 0.0, "bbox": None}
+        for det in phone_detections:
+            bbox = det["bbox"]
+            iou = bbox_iou(ref_box, bbox)
+            ox1, oy1, ox2, oy2 = [float(v) for v in bbox]
+            ocx = 0.5 * (ox1 + ox2)
+            ocy = 0.5 * (oy1 + oy2)
+            body_dist = np.hypot(ref_cx - ocx, ref_cy - ocy)
+            face_dist = np.hypot(face_cx - ocx, face_cy - ocy)
+            close_to_body = max(0.0, 1.0 - body_dist / max(1.0, 0.9 * max(ref_w, ref_h)))
+            close_to_face = max(0.0, 1.0 - face_dist / max(1.0, 0.9 * face_size))
+            upper_body_bonus = 1.0 if ocy <= (ry1 + 0.55 * ref_h) else 0.0
+            score = (
+                0.28 * float(det.get("confidence", 0.0))
+                + 0.30 * close_to_face
+                + 0.22 * close_to_body
+                + 0.10 * upper_body_bonus
+                + 0.10 * min(1.0, iou * 3.0)
+            )
+            if score > best["confidence"]:
+                best = {
+                    "matched": score >= 0.38,
+                    "confidence": float(score),
+                    "bbox": bbox,
+                }
+        return best
 
     def _draw_annotations(
-        self, frame: np.ndarray, bbox: list,
-        track_id: int, global_id: str, status: str,
-        pose_result: dict, det_conf: float
+        self,
+        frame: np.ndarray,
+        obs: StudentObservation,
+        attention: dict,
+        pose_result: dict,
+        phone_match: dict,
+        seat_id: str | None,
+        seat_state: str,
     ) -> np.ndarray:
-        """Draw bounding box, ID labels, and status on the frame."""
-        l, t, r, b = map(int, bbox)
-
-        # Color based on attention status
+        box = self._reference_bbox(obs)
+        x1, y1, x2, y2 = [int(round(v)) for v in box]
+        state = attention["attention_state"]
         color_map = {
-            "attentive": (0, 255, 0),       # Green
-            "distracted": (0, 0, 255),       # Red
-            "neutral": (0, 165, 255),        # Orange
+            "attentive": (0, 200, 0),
+            "distracted": (0, 0, 220),
+            "unknown": (140, 140, 140),
         }
-        color = color_map.get(status, (255, 255, 255))
+        color = color_map.get(state, (255, 255, 255))
+        if pose_result.get("hand_raised", False):
+            color = (255, 255, 0)
+        if phone_match.get("matched", False):
+            color = (0, 64, 255)
 
-        # Special color for hand raised
-        if pose_result.get("hand_raised"):
-            color = (255, 255, 0)  # Cyan
-        if pose_result.get("using_phone"):
-            color = (0, 0, 200)    # Dark red
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        seat_text = seat_id or "--"
+        label = f"{obs.global_id} {seat_text} | {state.upper()} {attention['attention_confidence']:.2f}"
+        sublabel = f"{attention['attention_mode']} | {seat_state}"
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        cv2.rectangle(frame, (x1, max(0, y1 - th - 18)), (x1 + tw + 6, y1), color, -1)
+        cv2.putText(frame, label, (x1 + 3, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+        cv2.putText(frame, sublabel, (x1, min(frame.shape[0] - 6, y2 + 16)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
 
-        # Draw bounding box
-        cv2.rectangle(frame, (l, t), (r, b), color, 2)
-
-        # Status label
-        status_text = status.upper()
-        if pose_result.get("hand_raised"):
-            status_text = "HAND RAISED"
-        elif pose_result.get("using_phone"):
-            status_text = "USING PHONE"
-
-        # ID and status label
-        label = f"{global_id} | {status_text}"
-        conf_label = f"conf: {det_conf:.2f}"
-
-        # Background for text
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.5
-        thickness = 1
-
-        (tw, th), _ = cv2.getTextSize(label, font, font_scale, thickness)
-        cv2.rectangle(frame, (l, t - th - 10), (l + tw + 4, t), color, -1)
-        cv2.putText(frame, label, (l + 2, t - 5),
-                    font, font_scale, (0, 0, 0), thickness)
-
-        # Confidence below box
-        cv2.putText(frame, conf_label, (l, b + 15),
-                    font, 0.4, color, 1)
-
+        if obs.body_bbox is None:
+            fx1, fy1, fx2, fy2 = [int(round(v)) for v in obs.face_bbox]
+            cv2.rectangle(frame, (fx1, fy1), (fx2, fy2), (255, 255, 255), 1)
+        if phone_match.get("matched", False) and phone_match.get("bbox") is not None:
+            px1, py1, px2, py2 = [int(round(v)) for v in phone_match["bbox"]]
+            cv2.rectangle(frame, (px1, py1), (px2, py2), (0, 255, 255), 1)
         return frame
 
-    def _save_attendance_report(self, csv_path: str):
-        """
-        Save combined attendance and attention report to CSV.
+    def _save_outputs(self):
+        attendance_csv_path = os.path.join(self.output_dir, "attendance_report.csv")
+        self._save_attendance_report(attendance_csv_path)
+        if self._seat_calibration is not None and self._reference_frame is not None:
+            save_seat_map_json(
+                self._seat_map,
+                self._seat_calibration,
+                os.path.join(self.output_dir, "seat_map.json"),
+            )
+            save_seat_map_png(
+                self._reference_frame,
+                self._seat_calibration,
+                self._seat_map,
+                os.path.join(self.output_dir, "seat_map.png"),
+            )
+            self._save_seating_timeline(os.path.join(self.output_dir, "student_seating_timeline.csv"))
+            self._save_attendance_events(os.path.join(self.output_dir, "attendance_events.csv"))
 
-        Columns:
-            Session_ID, Camera_ID, Global_Student_ID, Local_Track_ID,
-            Total_Frames, Presence_Time_Seconds, Present,
-            Attentive_Frames, Distracted_Frames, HandRaise_Frames,
-            UsingPhone_Frames, Confidence_Weighted_Attention_Score,
-            Attention_Percentage
-        """
+    def _save_attendance_report(self, csv_path: str):
         attendance_data = self.attendance_manager.get_attendance_report()
         attention_data = self.attention_engine.get_all_metrics()
-
+        seating_summary = self._seat_event_engine.get_student_summary() if self._seat_event_engine else {}
+        hand_raise_summary = self._hand_raise_tracker.get_student_summary() if self._hand_raise_tracker else {}
         os.makedirs(os.path.dirname(csv_path) if os.path.dirname(csv_path) else ".", exist_ok=True)
-
-        with open(csv_path, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                "Session_ID",
-                "Camera_ID",
-                "Global_Student_ID",
-                "Local_Track_ID",
-                "Total_Frames",
-                "Presence_Time_Seconds",
-                "Present",
-                "Attentive_Frames",
-                "Distracted_Frames",
-                "HandRaise_Frames",
-                "UsingPhone_Frames",
-                "Confidence_Weighted_Attention_Score",
-                "Attention_Percentage",
-            ])
-
+        with open(csv_path, "w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(
+                [
+                    "Session_ID",
+                    "Camera_ID",
+                    "Global_Student_ID",
+                    "Local_Track_ID",
+                    "Total_Frames",
+                    "Presence_Time_Seconds",
+                    "Present",
+                    "Seat_ID",
+                    "Seat_Rank",
+                    "Row_Rank",
+                    "Weighted_Avg_Seat_Rank",
+                    "Out_of_Class_Seconds",
+                    "Late_Arrival",
+                    "Early_Exit",
+                    "Hand_Raise_Count",
+                    "Hand_Raise_Seconds",
+                    "Attention_State",
+                    "Attention_Confidence",
+                    "Attention_Mode",
+                    "Attention_Reason",
+                    "Attentive_Frames",
+                    "Distracted_Frames",
+                    "Unknown_Frames",
+                    "HandRaise_Frames",
+                    "UsingPhone_Frames",
+                    "Confidence_Weighted_Attention_Score",
+                    "Attention_Percentage",
+                ]
+            )
             for record in attendance_data:
-                gid = record["global_id"]
-                metrics = attention_data.get(gid, {
-                    "attentive_frames": 0,
-                    "distracted_frames": 0,
-                    "handraise_frames": 0,
-                    "using_phone_frames": 0,
-                    "confidence_weighted_score": 0.0,
-                    "attention_percentage": 0.0,
-                })
+                student_id = record["global_id"]
+                metrics = attention_data.get(
+                    student_id,
+                    {
+                        "attention_state": "unknown",
+                        "attention_confidence": 0.0,
+                        "attention_mode": "limited",
+                        "attention_reason": "no-observations",
+                        "attentive_frames": 0,
+                        "distracted_frames": 0,
+                        "unknown_frames": 0,
+                        "handraise_frames": 0,
+                        "using_phone_frames": 0,
+                        "confidence_weighted_score": 0.0,
+                        "attention_percentage": 0.0,
+                    },
+                )
+                seat_info = seating_summary.get(student_id, {})
+                hand_info = hand_raise_summary.get(student_id, {"hand_raise_count": 0, "hand_raise_seconds": 0.0})
+                writer.writerow(
+                    [
+                        self.session_id,
+                        self.camera_id,
+                        student_id,
+                        record["local_track_id"],
+                        record["total_frames"],
+                        record["presence_time_seconds"],
+                        "Yes" if record["is_present"] else "No",
+                        seat_info.get("seat_id") or "",
+                        seat_info.get("seat_rank") or "",
+                        seat_info.get("row_rank") or "",
+                        seat_info.get("weighted_avg_seat_rank") or "",
+                        seat_info.get("out_of_class_seconds") or 0.0,
+                        "Yes" if seat_info.get("late_arrival") else "No",
+                        "Yes" if seat_info.get("early_exit") else "No",
+                        hand_info.get("hand_raise_count", 0),
+                        hand_info.get("hand_raise_seconds", 0.0),
+                        metrics["attention_state"],
+                        metrics["attention_confidence"],
+                        metrics["attention_mode"],
+                        metrics["attention_reason"],
+                        metrics["attentive_frames"],
+                        metrics["distracted_frames"],
+                        metrics["unknown_frames"],
+                        metrics["handraise_frames"],
+                        metrics["using_phone_frames"],
+                        metrics["confidence_weighted_score"],
+                        metrics["attention_percentage"],
+                    ]
+                )
+        logger.info("Attendance report saved: %s", csv_path)
 
-                writer.writerow([
-                    self.session_id,
-                    self.camera_id,
-                    gid,
-                    record["local_track_id"],
-                    record["total_frames"],
-                    record["presence_time_seconds"],
-                    "Yes" if record["is_present"] else "No",
-                    metrics.get("attentive_frames", 0),
-                    metrics.get("distracted_frames", 0),
-                    metrics.get("handraise_frames", 0),
-                    metrics.get("using_phone_frames", 0),
-                    metrics.get("confidence_weighted_score", 0.0),
-                    metrics.get("attention_percentage", 0.0),
-                ])
+    def _save_seating_timeline(self, csv_path: str):
+        if self._seat_event_engine is None:
+            return
+        with open(csv_path, "w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=[
+                    "student_id",
+                    "track_id",
+                    "seat_id",
+                    "seat_rank",
+                    "row_rank",
+                    "state",
+                    "start_frame",
+                    "end_frame",
+                    "duration_seconds",
+                ],
+            )
+            writer.writeheader()
+            writer.writerows(self._seat_event_engine.get_timeline_rows())
 
-        logger.info(f"Attendance report saved: {csv_path}")
-        print(f"\n📄 Attendance report saved: {csv_path}")
+    def _save_attendance_events(self, csv_path: str):
+        if self._seat_event_engine is None:
+            return
+        rows = self._seat_event_engine.get_event_rows()
+        if self._hand_raise_tracker is not None:
+            rows.extend(self._hand_raise_tracker.get_event_rows())
+        with open(csv_path, "w", newline="", encoding="utf-8") as handle:
+            fieldnames = sorted({key for row in rows for key in row.keys()}) if rows else [
+                "student_id",
+                "track_id",
+                "event_type",
+                "seat_id",
+                "from_seat",
+                "to_seat",
+                "start_frame",
+                "end_frame",
+                "duration_seconds",
+                "reason",
+                "confidence",
+                "peak_confidence",
+            ]
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
 
     def _print_session_summary(
-        self, video_path: str, total_frames: int,
-        processing_time: float, fps: float
+        self,
+        video_path: str,
+        total_frames: int,
+        processing_time: float,
+        fps: float,
     ):
-        """Print a comprehensive session summary to console."""
         attendance_summary = self.attendance_manager.get_summary()
         attention_metrics = self.attention_engine.get_all_metrics()
-
-        # Compute overall attention average
         if attention_metrics:
-            avg_attention = np.mean([
-                m["attention_percentage"]
-                for m in attention_metrics.values()
-            ])
+            avg_attention = float(np.mean([metrics["attention_percentage"] for metrics in attention_metrics.values()]))
+            avg_unknown = float(
+                np.mean(
+                    [
+                        (metrics["unknown_frames"] / max(1, metrics["total_frames"])) * 100.0
+                        for metrics in attention_metrics.values()
+                    ]
+                )
+            )
         else:
             avg_attention = 0.0
+            avg_unknown = 0.0
 
-        processing_fps = total_frames / processing_time if processing_time > 0 else 0
+        processing_fps = total_frames / processing_time if processing_time > 0 else 0.0
+        print(f"\n{'=' * 60}")
+        print("  SESSION SUMMARY")
+        print(f"{'=' * 60}")
+        print(f"  Session ID      : {self.session_id}")
+        print(f"  Camera ID       : {self.camera_id}")
+        print(f"  Video           : {video_path}")
+        print(f"  Total Frames    : {total_frames}")
+        print(f"  Video Duration  : {total_frames / max(1e-6, fps):.1f}s")
+        print(f"  Processing Time : {processing_time:.1f}s")
+        print(f"  Processing FPS  : {processing_fps:.1f}")
+        print(f"  Students Tracked: {attendance_summary['total_students']}")
+        print(f"  Present         : {attendance_summary['present_count']}")
+        print(f"  Avg Attention   : {avg_attention:.1f}%")
+        print(f"  Avg Unknown     : {avg_unknown:.1f}%")
+        if self._seat_event_engine is not None:
+            print(f"  Seat Map        : enabled ({len(self._seat_map)} seats)")
+        print(f"{'=' * 60}\n")
 
-        print(f"\n{'='*60}")
-        print(f"  📊 SESSION SUMMARY")
-        print(f"{'='*60}")
-        print(f"  Session ID     : {self.session_id}")
-        print(f"  Camera ID      : {self.camera_id}")
-        print(f"  Video          : {video_path}")
-        print(f"  Total Frames   : {total_frames}")
-        print(f"  Video Duration : {total_frames / fps:.1f}s")
-        print(f"  Processing Time: {processing_time:.1f}s")
-        print(f"  Processing FPS : {processing_fps:.1f}")
-        print(f"{'─'*60}")
-        print(f"  👥 ATTENDANCE")
-        print(f"     Total Students Detected : {attendance_summary['total_students']}")
-        print(f"     Present                 : {attendance_summary['present_count']}")
-        print(f"     Absent / Short Tracks   : {attendance_summary['absent_count']}")
-        print(f"{'─'*60}")
-        print(f"  🧠 ATTENTION")
-        print(f"     Average Attention       : {avg_attention:.1f}%")
-        print(f"     Students Tracked        : {len(attention_metrics)}")
-        print(f"{'─'*60}")
-        print(f"  📁 OUTPUTS")
-        print(f"     Video  : {self.output_dir}/output.avi")
-        print(f"     CSV    : {self.output_dir}/attendance_report.csv")
-        print(f"     Registry: {self.identity_manager.registry_path}")
-        print(f"{'='*60}\n")
-
-        logger.info(
-            f"Session complete: {attendance_summary['total_students']} students, "
-            f"{attendance_summary['present_count']} present, "
-            f"avg attention {avg_attention:.1f}%"
-        )

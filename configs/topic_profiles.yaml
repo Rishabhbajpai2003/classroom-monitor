@@ -1,0 +1,102 @@
+profiles:
+  default:
+    required_keywords:
+      - assignment
+      - homework
+      - exam
+      - lecture
+      - teacher
+      - chapter
+      - problem set
+      - worksheet
+    supporting_keywords:
+      - answer
+      - question
+      - explain
+      - notes
+      - board
+      - formula
+      - project
+      - presentation
+      - topic
+      - class
+      - subject
+      - example
+    off_topic_keywords:
+      - game
+      - movie
+      - party
+      - weekend
+      - instagram
+      - youtube
+      - lunch
+      - football
+      - cricket
+      - shopping
+    aliases:
+      assignment:
+        - task
+        - submission
+      teacher:
+        - sir
+        - maam
+        - mam
+        - professor
+      lecture:
+        - lesson
+        - class lecture
+      homework:
+        - home work
+      exam:
+        - test
+        - quiz
+      problem set:
+        - problems
+        - exercise
+  math:
+    required_keywords:
+      - algebra
+      - geometry
+      - calculus
+      - theorem
+      - equation
+      - derivative
+      - integral
+    supporting_keywords:
+      - solve
+      - proof
+      - graph
+      - function
+      - angle
+      - matrix
+      - formula
+    off_topic_keywords:
+      - game
+      - movie
+      - party
+      - weekend
+      - music
+  science:
+    required_keywords:
+      - experiment
+      - lab
+      - reaction
+      - biology
+      - physics
+      - chemistry
+      - molecule
+      - energy
+    supporting_keywords:
+      - hypothesis
+      - result
+      - observe
+      - cell
+      - force
+      - atom
+      - motion
+    off_topic_keywords:
+      - game
+      - movie
+      - party
+      - weekend
+      - social media

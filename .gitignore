@@ -1,6 +1,8 @@
 .venv/
 __pycache__/
 *.pyc
+pipeline.log
+temp_face_tracked.mp4
 
 weights/
 media/

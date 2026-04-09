@@ -1,6 +1,6 @@
 import cv2
 
-from app.pipeline.activity_config import COCO_SKELETON
+from detectors.activity_detector.config import COCO_SKELETON
 
 
 def draw_labeled_box(frame, box_xyxy, label, color, thickness=2):

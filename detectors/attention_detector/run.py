@@ -14,12 +14,10 @@ import sys
 
 import yaml
 
-import sys
-
 # Add project root to sys path so 'app' module can be resolved
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
-from processor import ClassroomProcessor
+from detectors.attention_detector.processor import ClassroomProcessor
 
 
 def setup_logging(level: str = "INFO"):
@@ -103,6 +101,12 @@ Examples:
         choices=["auto", "cuda", "mps", "cpu"],
         help="Compute device (overrides config).",
     )
+    parser.add_argument(
+        "--seat-calibration",
+        type=str,
+        default=None,
+        help="Optional seat calibration JSON path (overrides config).",
+    )
 
     return parser.parse_args()
 
@@ -127,6 +131,9 @@ def main():
         config["system"]["headless"] = True
     if args.device:
         config["system"]["device"] = args.device
+    if args.seat_calibration:
+        config.setdefault("seating", {})
+        config["seating"]["calibration_path"] = args.seat_calibration
 
     # Setup logging
     log_level = config.get("system", {}).get("log_level", "INFO")

@@ -3,8 +3,8 @@ import os
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
-from config import parse_args
-from processor import run_pipeline
+from detectors.activity_detector.config import parse_args
+from detectors.activity_detector.processor import run_pipeline
 
 
 def main():

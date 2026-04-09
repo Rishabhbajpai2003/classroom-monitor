@@ -1,11 +1,32 @@
 detection:
   model_size: yolo26s
-  confidence_threshold: 0.45
+  confidence_threshold: 0.22
+  image_size: 1536
+  tile_grid: 2
+  tile_overlap: 0.20
+  max_det: 350
+  iou_threshold: 0.65
+
+object_detection:
+  weights: weights/yolov8x-worldv2.pt
+  confidence_threshold: 0.14
   image_size: 1280
+  tile_grid: 2
+  tile_overlap: 0.20
+  max_det: 500
+  iou_threshold: 0.65
+
+pose:
+  weights: weights/yolo11x-pose.pt
+  confidence_threshold: 0.18
+  image_size: 1152
+  iou_threshold: 0.85
+  max_det: 300
+  ema_alpha: 0.30
 
 tracking:
-  max_age: 60
-  min_hits: 3
+  max_age: 120
+  min_hits: 2
   iou_threshold: 0.3
   max_cosine_distance: 0.4
   nn_budget: 100
@@ -17,23 +38,65 @@ identity:
   registry_path: outputs/student_registry.json
   embedding_model: mobilenet_v3_small
 
+student_backbone:
+  face_process_fps: 5.0
+  face_det_size: 1280
+  face_det_thresh: 0.24
+  face_tile_grid: 2
+  face_tile_overlap: 0.20
+  face_min_size: 12
+  identity_db_path: detectors/face_detector/identity_db.json
+  identity_db_save_every: 150
+  ttl: 120
+  archive_ttl: 1800
+  sim_thresh: 0.45
+  reid_sim_thresh: 0.55
+  min_confirm_hits: 2
+  new_id_confirm_hits: 2
+  new_id_confirm_quality: 0.20
+  high_det_score: 0.48
+  body_memory_frames: 18
+  full_min_height: 160
+  reduced_min_height: 96
+
 attendance:
   presence_threshold_seconds: 30
   min_track_frames: 20
 
 attention:
-  ema_alpha: 0.08
-  confidence_weighted: true
-  enter_attentive: 0.2
-  exit_attentive: 0.0
-  enter_distracted: -0.2
-  exit_distracted: 0.0
-  min_state_hold: 15
+  ema_alpha: 0.10
+  enter_attentive: 0.25
+  exit_attentive: 0.05
+  enter_distracted: -0.35
+  exit_distracted: -0.05
+  min_state_hold: 8
+  unknown_state_hold: 2
+  enable_unknown_state: true
+  phone_object_fps: 2.0
+  pose_fps: 3.0
+  full_min_evidence: 0.28
+  reduced_min_evidence: 0.36
+  limited_min_evidence: 0.60
   weights:
     looking_forward: 1.0
     hand_raised: 1.0
-    distracted: -1.0
+    distracted: -0.7
     using_phone: -2.0
+
+seating:
+  calibration_path: null
+  initial_confirm_seconds: 3.0
+  shift_confirm_seconds: 10.0
+
+attendance_events:
+  out_of_class_seconds: 20.0
+  exit_zone_seconds: 8.0
+  late_arrival_minutes: 5.0
+  early_exit_minutes: 5.0
+
+speech_topics:
+  config_path: configs/topic_profiles.yaml
+  course_profile: default
 
 system:
   device: auto
@@ -41,7 +104,6 @@ system:
   save_video: true
   save_csv: true
   camera_id: cam_01
-  frame_skip: 2
-  pose_skip: 5
+  frame_skip: 1
   output_dir: outputs
   log_level: INFO

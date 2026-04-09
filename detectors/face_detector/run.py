@@ -311,6 +311,7 @@ class Track:
     recent_appearance: Optional[np.ndarray] = None
     persistent_identity: bool = False
     velocity: np.ndarray = field(default_factory=lambda: np.zeros(4, dtype=np.float32))
+    metadata: Dict[str, object] = field(default_factory=dict)
 
     def update_embedding_bank(
         self,
@@ -1135,6 +1136,14 @@ class FaceIdentityDB:
         if avg_embedding is None:
             return None
 
+        metadata = record.get("metadata", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+        metadata = dict(metadata)
+        for legacy_key in ("name", "roll_number", "student_key"):
+            if legacy_key in record and legacy_key not in metadata:
+                metadata[legacy_key] = record.get(legacy_key)
+
         track = Track(
             track_id=track_id,
             bbox=np.zeros(4, dtype=np.float32),
@@ -1154,6 +1163,7 @@ class FaceIdentityDB:
             best_appearance=self._to_array(record.get("best_appearance")),
             best_appearance_quality=float(record.get("best_appearance_quality", 0.0)),
             persistent_identity=True,
+            metadata=metadata,
         )
         return track
 
@@ -1174,6 +1184,7 @@ class FaceIdentityDB:
             "avg_appearance": self._to_list(track.avg_appearance),
             "best_appearance": self._to_list(track.best_appearance),
             "best_appearance_quality": float(track.best_appearance_quality),
+            "metadata": dict(track.metadata or {}),
         }
 
     def load(self) -> Tuple[int, Dict[int, Track]]:

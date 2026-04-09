@@ -93,19 +93,30 @@ def prepare_vtp_video(
     frame_size: int = 160,
     img_size: int = 96,
 ) -> torch.Tensor:
-    prepared: List[np.ndarray] = []
+    return prepare_vtp_batch([list(frames_bgr)], frame_size=frame_size, img_size=img_size)
+
+
+def prepare_vtp_batch(
+    clips_bgr: Iterable[Iterable[np.ndarray]],
+    frame_size: int = 160,
+    img_size: int = 96,
+) -> torch.Tensor:
+    videos: List[np.ndarray] = []
     crop_offset = (frame_size - img_size) // 2
-    for frame_bgr in frames_bgr:
-        resized = cv2.resize(frame_bgr, (frame_size, frame_size), interpolation=cv2.INTER_LINEAR)
-        cropped = resized[crop_offset:crop_offset + img_size, crop_offset:crop_offset + img_size]
-        rgb = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        prepared.append(np.transpose(rgb, (2, 0, 1)))
-
-    if not prepared:
-        raise ValueError("At least one frame is required for VTP inference")
-
-    video = np.stack(prepared, axis=0)  # [T, C, H, W]
-    return torch.from_numpy(video).permute(1, 0, 2, 3).unsqueeze(0).contiguous()  # [1, C, T, H, W]
+    for frames_bgr in clips_bgr:
+        prepared: List[np.ndarray] = []
+        for frame_bgr in frames_bgr:
+            resized = cv2.resize(frame_bgr, (frame_size, frame_size), interpolation=cv2.INTER_LINEAR)
+            cropped = resized[crop_offset:crop_offset + img_size, crop_offset:crop_offset + img_size]
+            rgb = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+            prepared.append(np.transpose(rgb, (2, 0, 1)))
+        if not prepared:
+            raise ValueError("At least one frame is required for VTP inference")
+        videos.append(np.stack(prepared, axis=0))
+    if not videos:
+        raise ValueError("At least one clip is required for VTP inference")
+    batch = np.stack(videos, axis=0)  # [B, T, C, H, W]
+    return torch.from_numpy(batch).permute(0, 2, 1, 3, 4).contiguous()  # [B, C, T, H, W]
 
 
 class OfficialVTPTokenizer:
@@ -208,6 +219,13 @@ class OfficialVTPLipReader:
         encoder_output, _ = self.model.encode(src, src_mask)
         return encoder_output
 
+    @torch.no_grad()
+    def encode_batch(self, clips_bgr: Iterable[Iterable[np.ndarray]]) -> torch.Tensor:
+        src = prepare_vtp_batch(clips_bgr).to(self.device)
+        src_mask = torch.ones((src.size(0), 1, src.size(2)), device=self.device)
+        encoder_output, _ = self.model.encode(src, src_mask)
+        return encoder_output
+
     def _forward_pass(self, src: torch.Tensor, src_mask: torch.Tensor):
         encoder_output, src_mask = self.model.encode(src, src_mask)
         return self._beam_search(
@@ -288,6 +306,13 @@ class OfficialVTPVSD:
         logits = self.model(src, src_mask)
         return torch.sigmoid(logits)
 
+    @torch.no_grad()
+    def predict_proba_batch(self, clips_bgr: Iterable[Iterable[np.ndarray]]) -> torch.Tensor:
+        src = prepare_vtp_batch(clips_bgr).to(self.device)
+        src_mask = torch.ones((src.size(0), 1, src.size(2)), device=self.device)
+        logits = self.model(src, src_mask)
+        return torch.sigmoid(logits)
+
 
 class OfficialVTPEncoderMotionVSD:
     """
@@ -320,6 +345,20 @@ class OfficialVTPEncoderMotionVSD:
         features = self.reader.encode_frames(frames_bgr)  # [1, T, D]
         if features.size(1) <= 1:
             return torch.full((1, features.size(1)), 0.5, device=features.device)
+
+        delta = torch.norm(features[:, 1:] - features[:, :-1], dim=-1)
+        delta = torch.cat([delta[:, :1], delta], dim=1)
+        mean = delta.mean(dim=1, keepdim=True)
+        std = delta.std(dim=1, keepdim=True, unbiased=False).clamp_min(1e-4)
+        z = (delta - mean) / std
+        probs = torch.sigmoid(1.5 * z - 0.25)
+        return probs
+
+    @torch.no_grad()
+    def predict_proba_batch(self, clips_bgr: Iterable[Iterable[np.ndarray]]) -> torch.Tensor:
+        features = self.reader.encode_batch(clips_bgr)  # [B, T, D]
+        if features.size(1) <= 1:
+            return torch.full((features.size(0), features.size(1)), 0.5, device=features.device)
 
         delta = torch.norm(features[:, 1:] - features[:, :-1], dim=-1)
         delta = torch.cat([delta[:, :1], delta], dim=1)

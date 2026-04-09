@@ -13,7 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from detectors.face_detector.run import FaceIdentityDB, FaceTracker, InsightFaceBackend, color_from_id
+from app.models.student_backbone import format_student_global_id
 from detectors.vsd_detector.common import (
     TrackClipBuffer,
     draw_lip_box,
@@ -27,6 +27,13 @@ from detectors.vsd_detector.official_vtp import (
     OfficialVTPEncoderMotionVSD,
     OfficialVTPVSD,
 )
+
+def _default_color_from_id(track_id: int) -> tuple[int, int, int]:
+    base = abs(int(track_id)) * 73
+    return (50 + base % 180, 120 + (base * 3) % 100, 90 + (base * 7) % 140)
+
+
+COLOR_FROM_ID = _default_color_from_id
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -43,12 +50,12 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--process-fps", type=float, default=5.0, help="Run the face detector/tracker at this many FPS and fill intermediate frames from the last tracked face box")
     parser.add_argument("--infer-every", type=int, default=2, help="Run the VSD model every N frames per visible track")
     parser.add_argument("--speech-thresh", type=float, default=0.5, help="Probability threshold for classifying a frame as speech")
-    parser.add_argument("--det-size", type=int, default=960, help="InsightFace detection size")
+    parser.add_argument("--det-size", type=int, default=1280, help="InsightFace detection size")
     parser.add_argument("--det-thresh", type=float, default=0.28, help="InsightFace detector score threshold")
-    parser.add_argument("--tile-grid", type=int, default=1, help="Optional tiled detection grid for small/far faces")
+    parser.add_argument("--tile-grid", type=int, default=2, help="Optional tiled detection grid for small/far faces")
     parser.add_argument("--tile-overlap", type=float, default=0.20, help="Tile overlap ratio used when --tile-grid > 1")
     parser.add_argument("--ctx", type=int, default=0, help="InsightFace ctx id. Use -1 for CPU")
-    parser.add_argument("--min-face", type=int, default=20, help="Minimum face size in pixels")
+    parser.add_argument("--min-face", type=int, default=12, help="Minimum face size in pixels")
     parser.add_argument("--sim-thresh", type=float, default=0.45, help="Similarity threshold for face identity tracking")
     parser.add_argument("--ttl", type=int, default=120, help="Frames to keep an active face track alive")
     parser.add_argument("--archive-ttl", type=int, default=1800, help="Frames to keep archived face identities for re-id")
@@ -63,17 +70,16 @@ def build_argparser() -> argparse.ArgumentParser:
 
 def draw_overlay(frame, track, speech_prob: Optional[float], threshold: float) -> None:
     x1, y1, x2, y2 = track.bbox.astype(int)
-    color = color_from_id(track.track_id)
+    color = COLOR_FROM_ID(track.track_id)
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
     draw_lip_box(frame, track.bbox, color)
+    global_id = format_student_global_id(track.track_id)
 
     if speech_prob is None:
-        label = f"Student {track.track_id}" if track.track_id > 0 else "Student ?"
-        label += " | warming"
+        label = f"{global_id} | warming"
     else:
         status = "talking" if speech_prob >= threshold else "silent"
-        identity_label = f"Student {track.track_id}" if track.track_id > 0 else "Student ?"
-        label = f"{identity_label} | {status} {speech_prob:.2f}"
+        label = f"{global_id} | {status} {speech_prob:.2f}"
 
     (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
     y_top = max(0, y1 - th - 8)
@@ -84,6 +90,7 @@ def draw_overlay(frame, track, speech_prob: Optional[float], threshold: float) -
 
 def main() -> None:
     args = build_argparser().parse_args()
+    global COLOR_FROM_ID
     if not os.path.exists(args.input):
         raise FileNotFoundError(f"Input video not found: {args.input}")
     if not os.path.exists(args.cnn_checkpoint):
@@ -92,6 +99,10 @@ def main() -> None:
         raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
     if not args.checkpoint and not os.path.exists(args.lip_checkpoint):
         raise FileNotFoundError(f"Lip-reading checkpoint not found: {args.lip_checkpoint}")
+
+    from detectors.face_detector.run import FaceIdentityDB, FaceTracker, InsightFaceBackend, color_from_id
+
+    COLOR_FROM_ID = color_from_id
 
     device = resolve_torch_device(args.device)
     using_proxy = args.checkpoint is None
@@ -157,7 +168,7 @@ def main() -> None:
         os.makedirs(os.path.dirname(args.csv) or ".", exist_ok=True)
         csv_file = open(args.csv, "w", newline="", encoding="utf-8")
         csv_writer = csv.writer(csv_file)
-        csv_writer.writerow(["frame_idx", "track_id", "speech_prob", "is_speaking"])
+        csv_writer.writerow(["frame_idx", "global_id", "track_id", "speech_prob", "is_speaking"])
 
     track_scores: Dict[int, float] = {}
     frame_idx = 0
@@ -182,27 +193,41 @@ def main() -> None:
                 visible_tracks = get_gap_fill_tracks(tracker.tracks, frame_idx, gap_fill_frames)
             active_ids = []
 
+            batch_candidates = []
             for track in visible_tracks:
                 active_ids.append(track.track_id)
                 clip_buffer.push(track.track_id, frame_idx, frame, track.bbox)
 
                 previous = track_scores.get(track.track_id)
                 if frame_idx % max(1, args.infer_every) == 0:
-                    min_frames = max(8, args.clip_len // 2)
+                    min_frames = args.clip_len
                     if clip_buffer.ready(track.track_id, min_frames=min_frames):
                         clip_frames = temporal_subsample_frames(clip_buffer.get_frames(track.track_id), args.clip_len)
-                        probs = model.predict_proba(clip_frames)
-                        latest = float(probs[0, -1].item())
-                        if previous is None:
-                            track_scores[track.track_id] = latest
-                        else:
-                            track_scores[track.track_id] = 0.7 * previous + 0.3 * latest
+                        batch_candidates.append((track.track_id, previous, clip_frames))
 
+            if batch_candidates:
+                batch_probs = model.predict_proba_batch([item[2] for item in batch_candidates])
+                for batch_idx, (track_id, previous, _) in enumerate(batch_candidates):
+                    latest = float(batch_probs[batch_idx, -1].item())
+                    if previous is None:
+                        track_scores[track_id] = latest
+                    else:
+                        track_scores[track_id] = 0.7 * previous + 0.3 * latest
+
+            for track in visible_tracks:
                 score = track_scores.get(track.track_id)
                 draw_overlay(frame, track, score, args.speech_thresh)
 
                 if csv_writer is not None and score is not None:
-                    csv_writer.writerow([frame_idx, track.track_id, f"{score:.5f}", int(score >= args.speech_thresh)])
+                    csv_writer.writerow(
+                        [
+                            frame_idx,
+                            format_student_global_id(track.track_id),
+                            track.track_id,
+                            f"{score:.5f}",
+                            int(score >= args.speech_thresh),
+                        ]
+                    )
 
             clip_buffer.prune(frame_idx, active_ids)
 
