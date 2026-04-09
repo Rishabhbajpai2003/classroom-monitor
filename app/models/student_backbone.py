@@ -35,10 +35,48 @@ def _bbox_center(box: list[float] | np.ndarray) -> tuple[float, float]:
     return 0.5 * (x1 + x2), 0.5 * (y1 + y2)
 
 
-def format_student_global_id(track_id: int) -> str:
-    if int(track_id) > 0:
+def has_named_identity(metadata: Optional[dict[str, Any]] = None) -> bool:
+    if not metadata:
+        return False
+    student_key = str(metadata.get("student_key", "") or "").strip()
+    student_name = str(metadata.get("name", "") or "").strip()
+    return bool(student_key or student_name)
+
+
+def format_student_global_id(track_id: int, metadata: Optional[dict[str, Any]] = None) -> str:
+    if int(track_id) > 0 and has_named_identity(metadata):
         return f"STU_{int(track_id):03d}"
     return f"TEMP_{abs(int(track_id)):04d}"
+
+
+def seat_anchor_point(
+    body_bbox: Optional[list[float] | np.ndarray],
+    face_bbox: Optional[list[float] | np.ndarray] = None,
+) -> np.ndarray:
+    if body_bbox is not None:
+        x1, y1, x2, y2 = [float(v) for v in body_bbox]
+        width = max(1.0, x2 - x1)
+        height = max(1.0, y2 - y1)
+        return np.asarray(
+            [
+                0.5 * (x1 + x2),
+                y1 + 0.82 * height,
+            ],
+            dtype=np.float32,
+        )
+
+    if face_bbox is not None:
+        x1, y1, x2, y2 = [float(v) for v in face_bbox]
+        face_h = max(1.0, y2 - y1)
+        return np.asarray(
+            [
+                0.5 * (x1 + x2),
+                y2 + 1.85 * face_h,
+            ],
+            dtype=np.float32,
+        )
+
+    return np.zeros(2, dtype=np.float32)
 
 
 def classify_size_mode(
@@ -159,7 +197,7 @@ class SharedStudentBackbone:
         sys_cfg = self.config.get("system", {})
         back_cfg = self.config.get("student_backbone", {})
         self.device = str(sys_cfg.get("device", "auto"))
-        self.process_fps = float(back_cfg.get("face_process_fps", 5.0))
+        self.process_fps = float(back_cfg.get("face_process_fps", 8.0))
         self.det_size = int(back_cfg.get("face_det_size", 1280))
         self.det_thresh = float(back_cfg.get("face_det_thresh", 0.24))
         self.tile_grid = int(back_cfg.get("face_tile_grid", 2))
@@ -217,6 +255,9 @@ class SharedStudentBackbone:
             new_id_confirm_hits=int(self.config.get("student_backbone", {}).get("new_id_confirm_hits", 2)),
             new_id_confirm_quality=float(self.config.get("student_backbone", {}).get("new_id_confirm_quality", 0.20)),
             high_det_score=float(self.config.get("student_backbone", {}).get("high_det_score", 0.48)),
+            allow_new_persistent_identities=bool(
+                self.config.get("student_backbone", {}).get("allow_new_identities", False)
+            ),
         )
         self._identity_db = FaceIdentityDB(self.identity_db_path)
         next_track_id, stored_identities = self._identity_db.load()
@@ -283,7 +324,7 @@ class SharedStudentBackbone:
 
             observations.append(
                 StudentObservation(
-                    global_id=format_student_global_id(track_id),
+                    global_id=format_student_global_id(track_id, getattr(track, "metadata", None)),
                     track_id=track_id,
                     face_bbox=face_bbox,
                     body_bbox=body_bbox,

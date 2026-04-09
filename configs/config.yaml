@@ -39,7 +39,7 @@ identity:
   embedding_model: mobilenet_v3_small
 
 student_backbone:
-  face_process_fps: 5.0
+  face_process_fps: 8.0
   face_det_size: 1280
   face_det_thresh: 0.24
   face_tile_grid: 2
@@ -55,6 +55,7 @@ student_backbone:
   new_id_confirm_hits: 2
   new_id_confirm_quality: 0.20
   high_det_score: 0.48
+  allow_new_identities: false
   body_memory_frames: 18
   full_min_height: 160
   reduced_min_height: 96
@@ -85,7 +86,7 @@ attention:
 
 seating:
   calibration_path: null
-  initial_confirm_seconds: 3.0
+  initial_confirm_seconds: 1.0
   shift_confirm_seconds: 10.0
 
 attendance_events:
@@ -105,5 +106,9 @@ system:
   save_csv: true
   camera_id: cam_01
   frame_skip: 1
+  report_min_track_frames: 12
+  report_min_presence_seconds: 0.5
+  report_min_track_frames_unnamed: 60
+  report_min_presence_seconds_unnamed: 8.0
   output_dir: outputs
   log_level: INFO

@@ -194,6 +194,7 @@ class PoseAnalyzer:
 
         nose = keypoints_xy[0]
         shoulders = keypoints_xy[[5, 6]]
+        elbows = keypoints_xy[[7, 8]]
         wrists = keypoints_xy[[9, 10]]
         valid = keypoints_conf >= conf_threshold
 
@@ -207,11 +208,24 @@ class PoseAnalyzer:
         hand_points = [keypoints_xy[idx].tolist() for idx in [9, 10] if idx < len(valid) and valid[idx]]
         head_point = nose.tolist() if valid[0] else None
 
+        body_h = max(1.0, person_bbox[3] - person_bbox[1])
         hand_raised = False
-        if valid[9] and valid[5] and keypoints_xy[9][1] < keypoints_xy[5][1] - 0.04 * max(1.0, person_bbox[3] - person_bbox[1]):
-            hand_raised = True
-        if valid[10] and valid[6] and keypoints_xy[10][1] < keypoints_xy[6][1] - 0.04 * max(1.0, person_bbox[3] - person_bbox[1]):
-            hand_raised = True
+        head_y = float(nose[1]) if valid[0] else None
+        raise_checks = [
+            (9, 7, 5),
+            (10, 8, 6),
+        ]
+        for wrist_idx, elbow_idx, shoulder_idx in raise_checks:
+            if not (valid[wrist_idx] and valid[shoulder_idx]):
+                continue
+            wrist_y = float(keypoints_xy[wrist_idx][1])
+            shoulder_y = float(keypoints_xy[shoulder_idx][1])
+            elbow_y = float(keypoints_xy[elbow_idx][1]) if valid[elbow_idx] else shoulder_y
+            above_head = head_y is not None and wrist_y < head_y - 0.06 * body_h
+            above_shoulder = wrist_y < shoulder_y - 0.16 * body_h and elbow_y < shoulder_y + 0.02 * body_h
+            if above_head or above_shoulder:
+                hand_raised = True
+                break
 
         head_forward = False
         if valid[0]:
@@ -257,4 +271,3 @@ class PoseAnalyzer:
 
     def close(self) -> None:
         return None
-

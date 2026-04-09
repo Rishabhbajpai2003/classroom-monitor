@@ -47,11 +47,16 @@ import json
 import math
 import os
 import sys
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 try:
     from insightface.app import FaceAnalysis
@@ -72,6 +77,16 @@ try:
     from scipy.optimize import linear_sum_assignment
 except Exception:
     linear_sum_assignment = None
+
+from app.models.identity_enrichment import (
+    bank_match_score,
+    compact_embedding_bank,
+    current_utc_iso,
+    infer_profile_bucket,
+    infer_size_bucket,
+    sanitize_embedding_metadata,
+    summarize_embedding_bank,
+)
 
 
 DEFAULT_IDENTITY_DB_PATH = os.path.join(os.path.dirname(__file__), "identity_db.json")
@@ -289,6 +304,17 @@ class Detection:
 
 
 @dataclass
+class TrackObservation:
+    raw_track_id: int
+    frame_idx: int
+    bbox: np.ndarray
+    score: float
+    quality: float
+    embedding: np.ndarray
+    landmarks: Optional[np.ndarray] = None
+
+
+@dataclass
 class Track:
     track_id: int
     bbox: np.ndarray
@@ -299,6 +325,7 @@ class Track:
     best_score: float = 0.0
     embeddings: List[np.ndarray] = field(default_factory=list)
     embedding_qualities: List[float] = field(default_factory=list)
+    embedding_metadata: List[Dict[str, object]] = field(default_factory=list)
     avg_embedding: Optional[np.ndarray] = None
     best_embedding: Optional[np.ndarray] = None
     best_embedding_quality: float = 0.0
@@ -319,6 +346,8 @@ class Track:
         sample_quality: float = 0.0,
         max_bank: int = 15,
         novelty_thresh: float = 0.10,
+        sample_metadata: Optional[Dict[str, object]] = None,
+        duplicate_sim_thresh: float = 0.92,
     ) -> None:
         """
         Keep multiple embeddings per student so different poses/lighting are remembered.
@@ -327,32 +356,31 @@ class Track:
         new_emb = l2_normalize(new_emb.astype(np.float32))
         while len(self.embedding_qualities) < len(self.embeddings):
             self.embedding_qualities.append(max(0.5, float(self.best_embedding_quality)))
-        if not self.embeddings:
-            self.embeddings.append(new_emb)
-            self.embedding_qualities.append(float(sample_quality))
-        else:
-            sims = [cosine_similarity(new_emb, e) for e in self.embeddings]
-            best_sim = max(sims)
-            cosine_dist = 1.0 - best_sim
-            if cosine_dist >= novelty_thresh and len(self.embeddings) < max_bank:
-                self.embeddings.append(new_emb)
-                self.embedding_qualities.append(float(sample_quality))
-            else:
-                # Replace the most similar entry with a smoothed version.
-                best_idx = int(np.argmax(sims))
-                self.embeddings[best_idx] = l2_normalize(0.7 * self.embeddings[best_idx] + 0.3 * new_emb)
-                while len(self.embedding_qualities) < len(self.embeddings):
-                    self.embedding_qualities.append(float(sample_quality))
-                self.embedding_qualities[best_idx] = max(float(sample_quality), self.embedding_qualities[best_idx])
+        while len(self.embedding_metadata) < len(self.embeddings):
+            self.embedding_metadata.append(
+                sanitize_embedding_metadata(
+                    quality=float(self.embedding_qualities[len(self.embedding_metadata)]) if len(self.embedding_metadata) < len(self.embedding_qualities) else float(sample_quality),
+                    added_at=current_utc_iso(),
+                )
+            )
 
-        self.avg_embedding = weighted_average_embeddings(self.embeddings, self.embedding_qualities)
-        if self.recent_embedding is None:
-            self.recent_embedding = new_emb.copy()
-        else:
-            self.recent_embedding = l2_normalize(0.65 * self.recent_embedding + 0.35 * new_emb)
-        if self.best_embedding is None or sample_quality >= self.best_embedding_quality:
-            self.best_embedding = new_emb.copy()
-            self.best_embedding_quality = float(sample_quality)
+        effective_duplicate_thresh = max(float(duplicate_sim_thresh), 1.0 - float(novelty_thresh))
+        metadata = sanitize_embedding_metadata(sample_metadata, quality=float(sample_quality), added_at=current_utc_iso())
+        self.embeddings.append(new_emb)
+        self.embedding_qualities.append(float(sample_quality))
+        self.embedding_metadata.append(metadata)
+        self.embeddings, self.embedding_qualities, self.embedding_metadata = compact_embedding_bank(
+            self.embeddings,
+            self.embedding_qualities,
+            self.embedding_metadata,
+            max_bank=max_bank,
+            duplicate_sim_thresh=effective_duplicate_thresh,
+        )
+        self.avg_embedding, self.best_embedding, self.best_embedding_quality, self.recent_embedding = summarize_embedding_bank(
+            self.embeddings,
+            self.embedding_qualities,
+            self.embedding_metadata,
+        )
 
     def update_appearance_bank(
         self,
@@ -472,6 +500,7 @@ class FaceTracker:
         continuity_dist_gate: float = 0.32,
         continuity_relax: float = 0.10,
         continuity_bonus: float = 0.12,
+        allow_new_persistent_identities: bool = True,
     ) -> None:
         self.sim_thresh = sim_thresh
         self.iou_weight = iou_weight
@@ -494,12 +523,14 @@ class FaceTracker:
         self.continuity_dist_gate = continuity_dist_gate
         self.continuity_relax = continuity_relax
         self.continuity_bonus = continuity_bonus
+        self.allow_new_persistent_identities = bool(allow_new_persistent_identities)
 
         self.next_track_id = 1
         self.next_temp_track_id = -1
         self.tracks: Dict[int, Track] = {}
         self.archived_tracks: Dict[int, Track] = {}
         self.identity_aliases: Dict[int, int] = {}
+        self.last_step_observations: List[TrackObservation] = []
 
     def resolve_track_id(self, track_id: int) -> int:
         current = int(track_id)
@@ -536,7 +567,7 @@ class FaceTracker:
         for key, value in source_metadata.items():
             if value in (None, "", [], {}):
                 continue
-            if key in {"seed_sources", "source_images"}:
+            if key in {"seed_sources", "source_images", "harvest_source_videos", "harvest_phases"}:
                 current = list(target_metadata.get(key, []) or [])
                 for item in list(value):
                     if item not in current:
@@ -545,6 +576,36 @@ class FaceTracker:
                 continue
             if not target_metadata.get(key):
                 target_metadata[key] = value
+
+    @staticmethod
+    def _detection_sample_metadata(det: Detection, frame_idx: int) -> Dict[str, object]:
+        bbox = np.asarray(det.bbox, dtype=np.float32)
+        face_size = float(max(0.0, min(float(bbox[2] - bbox[0]), float(bbox[3] - bbox[1]))))
+        return sanitize_embedding_metadata(
+            {
+                "frame_idx": int(frame_idx),
+                "quality": float(det.quality),
+                "score": float(det.score),
+                "face_size": face_size,
+                "profile_bucket": infer_profile_bucket(bbox, det.landmarks),
+                "size_bucket": infer_size_bucket(face_size),
+                "source_kind": "runtime",
+            },
+            quality=float(det.quality),
+            face_size=face_size,
+        )
+
+    @staticmethod
+    def _build_observation(track: Track, det: Detection, frame_idx: int) -> TrackObservation:
+        return TrackObservation(
+            raw_track_id=int(track.track_id),
+            frame_idx=int(frame_idx),
+            bbox=np.asarray(det.bbox, dtype=np.float32).copy(),
+            score=float(det.score),
+            quality=float(det.quality),
+            embedding=l2_normalize(np.asarray(det.embedding, dtype=np.float32)),
+            landmarks=np.asarray(det.landmarks, dtype=np.float32).copy() if det.landmarks is not None else None,
+        )
 
     def _match_by_score_matrix(
         self,
@@ -631,27 +692,14 @@ class FaceTracker:
         return track_id
 
     def _embedding_match_score(self, det_emb: np.ndarray, track: Track) -> float:
-        if track.avg_embedding is None:
-            return -1.0
-        avg_sim = cosine_similarity(det_emb, track.avg_embedding)
-        sims = [avg_sim]
-        if track.recent_embedding is not None:
-            sims.append(0.97 * cosine_similarity(det_emb, track.recent_embedding))
-        if track.embeddings:
-            bank_scores = []
-            for idx, emb in enumerate(track.embeddings):
-                sim = cosine_similarity(det_emb, emb)
-                quality = 1.0
-                if idx < len(track.embedding_qualities):
-                    quality = max(0.05, float(track.embedding_qualities[idx]))
-                bank_scores.append(sim * (0.85 + 0.15 * quality))
-            if bank_scores:
-                sims.append(max(bank_scores))
-        if track.best_embedding is not None:
-            sims.append(cosine_similarity(det_emb, track.best_embedding))
-
-        best_bank = max(sims)
-        return 0.55 * best_bank + 0.45 * avg_sim
+        return bank_match_score(
+            det_emb,
+            track.avg_embedding,
+            track.embeddings,
+            track.embedding_qualities,
+            recent_embedding=track.recent_embedding,
+            best_embedding=track.best_embedding,
+        )
 
     def _appearance_match_score(self, det_desc: Optional[np.ndarray], track: Track) -> float:
         if det_desc is None or track.avg_appearance is None:
@@ -763,7 +811,11 @@ class FaceTracker:
             embeddings=[],
             avg_embedding=None,
         )
-        track.update_embedding_bank(det.embedding, sample_quality=det.quality)
+        track.update_embedding_bank(
+            det.embedding,
+            sample_quality=det.quality,
+            sample_metadata=self._detection_sample_metadata(det, frame_idx),
+        )
         track.update_appearance_bank(det.appearance, sample_quality=det.quality)
         if track.track_id > 0 and track.hits >= self.min_confirm_hits and track.avg_embedding is not None:
             track.persistent_identity = True
@@ -787,7 +839,11 @@ class FaceTracker:
         track.hits += 1
         track.misses = 0
         track.best_score = max(track.best_score, det.score)
-        track.update_embedding_bank(det.embedding, sample_quality=bank_quality)
+        track.update_embedding_bank(
+            det.embedding,
+            sample_quality=bank_quality,
+            sample_metadata=self._detection_sample_metadata(det, frame_idx),
+        )
         track.update_appearance_bank(det.appearance, sample_quality=bank_quality)
         if track.track_id > 0 and track.hits >= self.min_confirm_hits and track.avg_embedding is not None:
             track.persistent_identity = True
@@ -808,7 +864,11 @@ class FaceTracker:
         track.misses = 0
         track.hits += 1
         track.best_score = max(track.best_score, det.score)
-        track.update_embedding_bank(det.embedding, sample_quality=det.quality)
+        track.update_embedding_bank(
+            det.embedding,
+            sample_quality=det.quality,
+            sample_metadata=self._detection_sample_metadata(det, frame_idx),
+        )
         track.update_appearance_bank(det.appearance, sample_quality=det.quality)
         if track.track_id > 0 and track.hits >= self.min_confirm_hits and track.avg_embedding is not None:
             track.persistent_identity = True
@@ -831,8 +891,14 @@ class FaceTracker:
         self._record_identity_alias(young_track_id, archived_track_id)
         self._merge_track_metadata(restored_track, young_track)
 
-        for emb in young_track.embeddings:
-            restored_track.update_embedding_bank(emb, sample_quality=young_track.best_embedding_quality)
+        for idx, emb in enumerate(young_track.embeddings):
+            sample_quality = (
+                float(young_track.embedding_qualities[idx])
+                if idx < len(young_track.embedding_qualities)
+                else float(young_track.best_embedding_quality)
+            )
+            sample_metadata = young_track.embedding_metadata[idx] if idx < len(young_track.embedding_metadata) else None
+            restored_track.update_embedding_bank(emb, sample_quality=sample_quality, sample_metadata=sample_metadata)
         for desc in young_track.appearance_embeddings:
             restored_track.update_appearance_bank(desc, sample_quality=young_track.best_appearance_quality)
 
@@ -853,8 +919,14 @@ class FaceTracker:
         self._record_identity_alias(young_track_id, active_track_id)
         self._merge_track_metadata(target_track, young_track)
 
-        for emb in young_track.embeddings:
-            target_track.update_embedding_bank(emb, sample_quality=young_track.best_embedding_quality)
+        for idx, emb in enumerate(young_track.embeddings):
+            sample_quality = (
+                float(young_track.embedding_qualities[idx])
+                if idx < len(young_track.embedding_qualities)
+                else float(young_track.best_embedding_quality)
+            )
+            sample_metadata = young_track.embedding_metadata[idx] if idx < len(young_track.embedding_metadata) else None
+            target_track.update_embedding_bank(emb, sample_quality=sample_quality, sample_metadata=sample_metadata)
         for desc in young_track.appearance_embeddings:
             target_track.update_appearance_bank(desc, sample_quality=young_track.best_appearance_quality)
 
@@ -925,6 +997,9 @@ class FaceTracker:
                     self._merge_track_into_active_identity(provisional_id, best_track_id, frame_idx)
                 continue
 
+            if not self.allow_new_persistent_identities:
+                continue
+
             if probe.hits < self.new_id_confirm_hits:
                 continue
             if max(probe.best_embedding_quality, probe.best_appearance_quality) < self.new_id_confirm_quality:
@@ -956,6 +1031,7 @@ class FaceTracker:
             self._merge_track_into_archived_identity(young_tid, archived_tid, frame_idx)
 
     def step(self, detections: List[Detection], frame_idx: int) -> List[Track]:
+        observations: List[TrackObservation] = []
         # Age unmatched tracks.
         for track in self.tracks.values():
             if track.last_frame_idx != frame_idx:
@@ -979,6 +1055,7 @@ class FaceTracker:
             if score < -1e8:
                 continue
             self._update_track(self.tracks[tid], detections[di], frame_idx)
+            observations.append(self._build_observation(self.tracks[tid], detections[di], frame_idx))
             matched_det_indices.add(di)
             matched_track_ids.add(tid)
 
@@ -995,6 +1072,7 @@ class FaceTracker:
                 if di in matched_det_indices or tid in matched_track_ids:
                     continue
                 self._update_track(self.tracks[tid], detections[di], frame_idx)
+                observations.append(self._build_observation(self.tracks[tid], detections[di], frame_idx))
                 matched_det_indices.add(di)
                 matched_track_ids.add(tid)
 
@@ -1021,6 +1099,9 @@ class FaceTracker:
             if di in matched_det_indices or tid in revived_track_ids or tid not in self.archived_tracks:
                 continue
             self._restore_archived_track(self.archived_tracks[tid], detections[di], frame_idx)
+            restored_track = self.tracks.get(tid)
+            if restored_track is not None:
+                observations.append(self._build_observation(restored_track, detections[di], frame_idx))
             matched_det_indices.add(di)
             revived_track_ids.add(tid)
 
@@ -1028,6 +1109,7 @@ class FaceTracker:
         for di in det_indices:
             if di not in matched_det_indices:
                 track = self._create_track(detections[di], frame_idx)
+                observations.append(self._build_observation(track, detections[di], frame_idx))
                 matched_track_ids.add(track.track_id)
 
         # Resolve provisional tracklets against existing identities before assigning
@@ -1038,6 +1120,7 @@ class FaceTracker:
         # Return active tracks visible in this frame.
         visible_tracks = [t for t in self.tracks.values() if t.last_frame_idx == frame_idx]
         visible_tracks.sort(key=lambda t: t.track_id)
+        self.last_step_observations = observations
         return visible_tracks
 
 
@@ -1178,10 +1261,16 @@ class FaceIdentityDB:
         appearance_embeddings = self._to_array_bank(record.get("appearance_embeddings"))
         embedding_qualities = [float(v) for v in record.get("embedding_qualities", [])]
         appearance_qualities = [float(v) for v in record.get("appearance_qualities", [])]
+        embedding_metadata = record.get("embedding_metadata", [])
+        if not isinstance(embedding_metadata, list):
+            embedding_metadata = []
         while len(embedding_qualities) < len(embeddings):
             embedding_qualities.append(float(record.get("best_embedding_quality", 0.5)))
         while len(appearance_qualities) < len(appearance_embeddings):
             appearance_qualities.append(float(record.get("best_appearance_quality", 0.5)))
+        while len(embedding_metadata) < len(embeddings):
+            quality = float(embedding_qualities[len(embedding_metadata)]) if len(embedding_metadata) < len(embedding_qualities) else float(record.get("best_embedding_quality", 0.5))
+            embedding_metadata.append(sanitize_embedding_metadata(quality=quality, added_at=current_utc_iso()))
         avg_embedding = self._to_array(record.get("avg_embedding"))
         avg_appearance = self._to_array(record.get("avg_appearance"))
         if avg_embedding is None:
@@ -1209,17 +1298,30 @@ class FaceIdentityDB:
             best_score=float(record.get("best_score", 0.0)),
             embeddings=embeddings,
             embedding_qualities=embedding_qualities,
+            embedding_metadata=[sanitize_embedding_metadata(item, quality=embedding_qualities[idx] if idx < len(embedding_qualities) else 0.5) for idx, item in enumerate(embedding_metadata[: len(embeddings)])],
             avg_embedding=avg_embedding,
             best_embedding=self._to_array(record.get("best_embedding")),
             best_embedding_quality=float(record.get("best_embedding_quality", 0.0)),
+            recent_embedding=self._to_array(record.get("recent_embedding")),
             appearance_embeddings=appearance_embeddings,
             appearance_qualities=appearance_qualities,
             avg_appearance=avg_appearance,
             best_appearance=self._to_array(record.get("best_appearance")),
             best_appearance_quality=float(record.get("best_appearance_quality", 0.0)),
+            recent_appearance=self._to_array(record.get("recent_appearance")),
             persistent_identity=True,
             metadata=metadata,
         )
+        if track.best_embedding is None or track.recent_embedding is None:
+            avg_embedding, best_embedding, best_embedding_quality, recent_embedding = summarize_embedding_bank(
+                track.embeddings,
+                track.embedding_qualities,
+                track.embedding_metadata,
+            )
+            track.avg_embedding = avg_embedding
+            track.best_embedding = best_embedding
+            track.best_embedding_quality = max(float(track.best_embedding_quality), float(best_embedding_quality))
+            track.recent_embedding = recent_embedding
         return track
 
     def _track_to_record(self, track: Track) -> Dict[str, object]:
@@ -1231,14 +1333,17 @@ class FaceIdentityDB:
             "best_score": float(track.best_score),
             "embeddings": self._to_list_bank(track.embeddings),
             "embedding_qualities": [float(v) for v in track.embedding_qualities],
+            "embedding_metadata": [dict(item) for item in track.embedding_metadata],
             "avg_embedding": self._to_list(track.avg_embedding),
             "best_embedding": self._to_list(track.best_embedding),
             "best_embedding_quality": float(track.best_embedding_quality),
+            "recent_embedding": self._to_list(track.recent_embedding),
             "appearance_embeddings": self._to_list_bank(track.appearance_embeddings),
             "appearance_qualities": [float(v) for v in track.appearance_qualities],
             "avg_appearance": self._to_list(track.avg_appearance),
             "best_appearance": self._to_list(track.best_appearance),
             "best_appearance_quality": float(track.best_appearance_quality),
+            "recent_appearance": self._to_list(track.recent_appearance),
             "metadata": dict(track.metadata or {}),
         }
 
@@ -1273,7 +1378,7 @@ class FaceIdentityDB:
 
         identities = tracker.persistent_identity_tracks()
         payload = {
-            "version": 1,
+            "version": 2,
             "next_track_id": int(tracker.next_track_id),
             "identities": [self._track_to_record(identities[track_id]) for track_id in sorted(identities.keys())],
         }
@@ -1489,6 +1594,11 @@ def build_argparser() -> argparse.ArgumentParser:
         default=150,
         help="Save the identity database every N frames during processing. Use <= 0 to save only at shutdown.",
     )
+    parser.add_argument(
+        "--allow-new-identities",
+        action="store_true",
+        help="Allow provisional tracks to become brand new permanent identities. Disabled by default for roster-only runs.",
+    )
     parser.add_argument("--max-frames", type=int, default=-1, help="Optional cap for debugging")
     parser.add_argument("--display", action="store_true", help="Show a live preview window while processing")
     return parser
@@ -1517,6 +1627,7 @@ def main() -> None:
         new_id_confirm_quality=args.new_id_confirm_quality,
         provisional_match_margin=args.provisional_match_margin,
         high_det_score=args.high_det_score,
+        allow_new_persistent_identities=bool(args.allow_new_identities),
     )
     identity_db = FaceIdentityDB(args.identity_db)
     next_track_id, stored_identities = identity_db.load()

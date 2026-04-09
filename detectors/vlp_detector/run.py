@@ -25,7 +25,7 @@ from app.models.seat_map import (
     save_seat_map_png,
 )
 from app.models.speech_topics import SpeechTopicClassifier
-from app.models.student_backbone import format_student_global_id
+from app.models.student_backbone import format_student_global_id, seat_anchor_point
 from detectors.vsd_detector.common import (
     TrackClipBuffer,
     crop_face_context,
@@ -246,6 +246,7 @@ def main() -> None:
         archive_ttl=args.archive_ttl,
         reid_sim_thresh=args.reid_sim_thresh,
         high_det_score=args.high_det_score,
+        allow_new_persistent_identities=False,
     )
     identity_db = FaceIdentityDB(args.identity_db)
     next_track_id, stored_identities = identity_db.load()
@@ -281,6 +282,7 @@ def main() -> None:
 
     csv_file = None
     csv_writer = None
+    segment_rows: List[dict] = []
     if args.csv:
         os.makedirs(os.path.dirname(args.csv) or ".", exist_ok=True)
         csv_file = open(args.csv, "w", newline="", encoding="utf-8")
@@ -328,7 +330,7 @@ def main() -> None:
         seat_event_engine = SeatEventEngine(
             seat_map,
             fps=fps,
-            initial_confirm_seconds=3.0,
+            initial_confirm_seconds=1.0,
             shift_confirm_seconds=10.0,
             out_of_class_seconds=20.0,
             exit_zone_seconds=8.0,
@@ -355,7 +357,9 @@ def main() -> None:
         )
         seat_counter = Counter(seat_id for seat_id in state.segment_seat_ids if seat_id)
         segment_seat_id = seat_counter.most_common(1)[0][0] if seat_counter else state.last_seat_id
-        global_id = format_student_global_id(track_id)
+        resolved_track = tracker.get_track_by_any_id(track_id)
+        metadata = getattr(resolved_track, "metadata", None) if resolved_track is not None else None
+        global_id = format_student_global_id(track_id, metadata)
 
         state.last_transcript = transcript
         state.last_topic_label = topic_result["topic_label"]
@@ -365,23 +369,23 @@ def main() -> None:
             state.last_seat_id = segment_seat_id
 
         if csv_writer is not None and transcript:
-            csv_writer.writerow(
-                {
-                    "global_id": global_id,
-                    "track_id": track_id,
-                    "seat_id": segment_seat_id or "",
-                    "start_frame_idx": state.segment_frame_indices[0],
-                    "end_frame_idx": state.segment_frame_indices[-1],
-                    "mean_speech_prob": f"{mean_prob:.4f}",
-                    "transcript": transcript,
-                    "topic_label": topic_result["topic_label"],
-                    "topic_score": f"{float(topic_result['topic_score']):.4f}",
-                    "topic_reason": topic_result["topic_reason"],
-                    "matched_required": "|".join(topic_result["matched_required"]),
-                    "matched_supporting": "|".join(topic_result["matched_supporting"]),
-                    "matched_off_topic": "|".join(topic_result["matched_off_topic"]),
-                }
-            )
+            row = {
+                "global_id": global_id,
+                "track_id": track_id,
+                "seat_id": segment_seat_id or "",
+                "start_frame_idx": state.segment_frame_indices[0],
+                "end_frame_idx": state.segment_frame_indices[-1],
+                "mean_speech_prob": f"{mean_prob:.4f}",
+                "transcript": transcript,
+                "topic_label": topic_result["topic_label"],
+                "topic_score": f"{float(topic_result['topic_score']):.4f}",
+                "topic_reason": topic_result["topic_reason"],
+                "matched_required": "|".join(topic_result["matched_required"]),
+                "matched_supporting": "|".join(topic_result["matched_supporting"]),
+                "matched_off_topic": "|".join(topic_result["matched_off_topic"]),
+            }
+            segment_rows.append(row)
+            csv_writer.writerow(row)
 
         state.reset_segment()
 
@@ -409,12 +413,9 @@ def main() -> None:
                 seat_projection = seat_projection_manager.project(frame, frame_idx)
                 seat_students = [
                     {
-                        "global_id": format_student_global_id(track.track_id),
+                        "global_id": format_student_global_id(track.track_id, getattr(track, "metadata", None)),
                         "track_id": track.track_id,
-                        "center": [
-                            float((track.bbox[0] + track.bbox[2]) * 0.5),
-                            float((track.bbox[1] + track.bbox[3]) * 0.5),
-                        ],
+                        "center": seat_anchor_point(None, track.bbox).tolist(),
                     }
                     for track in visible_tracks
                 ]
@@ -427,7 +428,7 @@ def main() -> None:
                 state = states.setdefault(track.track_id, TrackSpeechState())
                 state.last_seen_frame_idx = frame_idx
 
-                global_id = format_student_global_id(track.track_id)
+                global_id = format_student_global_id(track.track_id, getattr(track, "metadata", None))
                 current_seat_id = seat_assignments.get(global_id) or state.last_seat_id
                 if current_seat_id:
                     state.last_seat_id = current_seat_id
@@ -450,7 +451,7 @@ def main() -> None:
                     states[track.track_id].speech_prob = 1.0
 
             for track in visible_tracks:
-                global_id = format_student_global_id(track.track_id)
+                global_id = format_student_global_id(track.track_id, getattr(track, "metadata", None))
                 state = states[track.track_id]
                 face_crop = face_crops[track.track_id]
                 current_seat_id = seat_assignments.get(global_id) or state.last_seat_id
@@ -533,6 +534,70 @@ def main() -> None:
     if seat_calibration is not None and seat_reference_frame is not None:
         save_seat_map_json(seat_map, seat_calibration, output_dir / "seat_map.json")
         save_seat_map_png(seat_reference_frame, seat_calibration, seat_map, output_dir / "seat_map.png")
+
+    if args.csv:
+        transcript_csv = output_dir / "lip_reading_transcript.csv"
+        topic_csv = output_dir / "speech_topic_classification.csv"
+        with transcript_csv.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=[
+                    "global_id",
+                    "track_id",
+                    "seat_id",
+                    "start_frame_idx",
+                    "end_frame_idx",
+                    "mean_speech_prob",
+                    "transcript",
+                ],
+            )
+            writer.writeheader()
+            for row in segment_rows:
+                writer.writerow(
+                    {
+                        "global_id": row["global_id"],
+                        "track_id": row["track_id"],
+                        "seat_id": row["seat_id"],
+                        "start_frame_idx": row["start_frame_idx"],
+                        "end_frame_idx": row["end_frame_idx"],
+                        "mean_speech_prob": row["mean_speech_prob"],
+                        "transcript": row["transcript"],
+                    }
+                )
+        with topic_csv.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=[
+                    "global_id",
+                    "track_id",
+                    "seat_id",
+                    "start_frame_idx",
+                    "end_frame_idx",
+                    "topic_label",
+                    "topic_score",
+                    "topic_reason",
+                    "matched_required",
+                    "matched_supporting",
+                    "matched_off_topic",
+                ],
+            )
+            writer.writeheader()
+            for row in segment_rows:
+                writer.writerow(
+                    {
+                        "global_id": row["global_id"],
+                        "track_id": row["track_id"],
+                        "seat_id": row["seat_id"],
+                        "start_frame_idx": row["start_frame_idx"],
+                        "end_frame_idx": row["end_frame_idx"],
+                        "topic_label": row["topic_label"],
+                        "topic_score": row["topic_score"],
+                        "topic_reason": row["topic_reason"],
+                        "matched_required": row["matched_required"],
+                        "matched_supporting": row["matched_supporting"],
+                        "matched_off_topic": row["matched_off_topic"],
+                    }
+                )
 
     print(f"Done. Lip-reading video saved to: {args.output}")
     print(f"Persistent identity DB saved to: {args.identity_db} ({saved_identity_count} identities)")

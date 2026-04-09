@@ -35,6 +35,11 @@ from detectors.face_detector.run import (  # noqa: E402
     Track,
     ensure_parent_dir,
 )
+from app.models.identity_enrichment import (  # noqa: E402
+    current_utc_iso,
+    infer_profile_bucket,
+    infer_size_bucket,
+)
 
 
 SUPPORTED_IMAGE_EXTENSIONS = {".heic", ".jpg", ".jpeg", ".png", ".webp", ".bmp"}
@@ -216,7 +221,24 @@ def create_seed_track(track_id: int, student: StudentFolder, backend: InsightFac
         if det is None:
             continue
         track.best_score = max(track.best_score, float(det.score))
-        track.update_embedding_bank(det.embedding, sample_quality=float(det.quality))
+        bbox = np.asarray(det.bbox, dtype=np.float32)
+        face_size = float(max(0.0, min(float(bbox[2] - bbox[0]), float(bbox[3] - bbox[1]))))
+        track.update_embedding_bank(
+            det.embedding,
+            sample_quality=float(det.quality),
+            sample_metadata={
+                "source_kind": "seed",
+                "source_image": image_path.name,
+                "source_folder": student.folder.as_posix(),
+                "added_at": current_utc_iso(),
+                "quality": float(det.quality),
+                "score": float(det.score),
+                "face_size": face_size,
+                "profile_bucket": infer_profile_bucket(bbox, det.landmarks),
+                "size_bucket": infer_size_bucket(face_size),
+            },
+            max_bank=48,
+        )
         if det.appearance is not None:
             track.update_appearance_bank(det.appearance, sample_quality=float(det.quality))
         sample_index += 1
@@ -254,6 +276,7 @@ def write_registry_json(registry_path: Path, tracks: list[Track]) -> None:
     for track in tracks:
         global_id = f"STU_{int(track.track_id):03d}"
         metadata = dict(track.metadata or {})
+        embedding_metadata = [dict(item) for item in track.embedding_metadata]
         payload[global_id] = {
             "global_id": global_id,
             "track_id": int(track.track_id),
@@ -263,31 +286,46 @@ def write_registry_json(registry_path: Path, tracks: list[Track]) -> None:
             "embedding": np.asarray(track.avg_embedding, dtype=np.float32).tolist() if track.avg_embedding is not None else None,
             "embeddings": [np.asarray(item, dtype=np.float32).tolist() for item in track.embeddings],
             "embedding_qualities": [float(value) for value in track.embedding_qualities],
+            "embedding_metadata": embedding_metadata,
+            "embedding_count": len(track.embeddings),
             "first_seen": seeded_at,
             "last_seen": seeded_at,
             "seed_sources": metadata.get("seed_sources", []),
+            "harvest_source_videos": metadata.get("harvest_source_videos", []),
         }
     with registry_path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
 
 
+def track_manifest_row(track: Track) -> dict[str, object]:
+    metadata = dict(track.metadata or {})
+    last_embedding_meta = track.embedding_metadata[0] if track.embedding_metadata else {}
+    harvested_count = sum(
+        1
+        for item in track.embedding_metadata
+        if str(item.get("source_kind", "") or "").strip() == "harvest"
+    )
+    return {
+        "track_id": int(track.track_id),
+        "global_id": f"STU_{int(track.track_id):03d}",
+        "name": metadata.get("name", ""),
+        "roll_number": metadata.get("roll_number", ""),
+        "student_key": metadata.get("student_key", ""),
+        "seed_sample_count": int(metadata.get("seed_sample_count", 0)),
+        "embedding_count": len(track.embeddings),
+        "harvested_sample_count": harvested_count,
+        "seed_sources": list(metadata.get("seed_sources", [])),
+        "harvest_source_videos": list(metadata.get("harvest_source_videos", [])),
+        "source_folder": metadata.get("source_folder", ""),
+        "last_embedding_source": last_embedding_meta.get("source_video") or last_embedding_meta.get("source_image") or "",
+        "last_enriched_at": metadata.get("last_enriched_at", ""),
+    }
+
+
 def write_manifests(manifest_json: Path, manifest_csv: Path, tracks: list[Track]) -> None:
     ensure_parent_dir(str(manifest_json))
     ensure_parent_dir(str(manifest_csv))
-    rows: list[dict[str, object]] = []
-    for track in tracks:
-        metadata = dict(track.metadata or {})
-        row = {
-            "track_id": int(track.track_id),
-            "global_id": f"STU_{int(track.track_id):03d}",
-            "name": metadata.get("name", ""),
-            "roll_number": metadata.get("roll_number", ""),
-            "student_key": metadata.get("student_key", ""),
-            "seed_sample_count": int(metadata.get("seed_sample_count", 0)),
-            "seed_sources": list(metadata.get("seed_sources", [])),
-            "source_folder": metadata.get("source_folder", ""),
-        }
-        rows.append(row)
+    rows = [track_manifest_row(track) for track in tracks]
 
     with manifest_json.open("w", encoding="utf-8") as handle:
         json.dump(rows, handle, indent=2)
@@ -302,14 +340,20 @@ def write_manifests(manifest_json: Path, manifest_csv: Path, tracks: list[Track]
                 "roll_number",
                 "student_key",
                 "seed_sample_count",
+                "embedding_count",
+                "harvested_sample_count",
                 "seed_sources",
+                "harvest_source_videos",
                 "source_folder",
+                "last_embedding_source",
+                "last_enriched_at",
             ],
         )
         writer.writeheader()
         for row in rows:
             serializable = dict(row)
             serializable["seed_sources"] = ";".join(serializable["seed_sources"])
+            serializable["harvest_source_videos"] = ";".join(serializable["harvest_source_videos"])
             writer.writerow(serializable)
 
 

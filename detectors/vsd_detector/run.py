@@ -73,7 +73,7 @@ def draw_overlay(frame, track, speech_prob: Optional[float], threshold: float) -
     color = COLOR_FROM_ID(track.track_id)
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
     draw_lip_box(frame, track.bbox, color)
-    global_id = format_student_global_id(track.track_id)
+    global_id = format_student_global_id(track.track_id, getattr(track, "metadata", None))
 
     if speech_prob is None:
         label = f"{global_id} | warming"
@@ -134,6 +134,7 @@ def main() -> None:
         archive_ttl=args.archive_ttl,
         reid_sim_thresh=args.reid_sim_thresh,
         high_det_score=args.high_det_score,
+        allow_new_persistent_identities=False,
     )
     identity_db = FaceIdentityDB(args.identity_db)
     next_track_id, stored_identities = identity_db.load()
@@ -222,7 +223,7 @@ def main() -> None:
                     csv_writer.writerow(
                         [
                             frame_idx,
-                            format_student_global_id(track.track_id),
+                            format_student_global_id(track.track_id, getattr(track, "metadata", None)),
                             track.track_id,
                             f"{score:.5f}",
                             int(score >= args.speech_thresh),

@@ -20,7 +20,7 @@ from app.models.seat_map import (
     save_seat_map_json,
     save_seat_map_png,
 )
-from app.models.student_backbone import SharedStudentBackbone, StudentObservation
+from app.models.student_backbone import SharedStudentBackbone, StudentObservation, seat_anchor_point
 from app.utils.draw_utils import draw_labeled_box, draw_pose_skeleton
 from app.utils.source_utils import is_youtube_url, resolve_source
 from app.utils.vision_utils import normalize_list, point_to_box_distance
@@ -213,7 +213,7 @@ def _build_runtime_config(args) -> dict:
         },
         "seating": {
             "calibration_path": args.seat_calibration,
-            "initial_confirm_seconds": 3.0,
+            "initial_confirm_seconds": 1.0,
             "shift_confirm_seconds": 10.0,
         },
         "attendance_events": {
@@ -229,6 +229,78 @@ def _safe_token(text: str) -> str:
     out = "".join(ch if ch.isalnum() else "_" for ch in str(text).strip().lower())
     out = out.strip("_")
     return out or "activity"
+
+
+def _write_dict_rows(csv_path: Path, fieldnames: list[str], rows: list[dict]) -> None:
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(csv_path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+
+def _signal_rows(
+    signal_name: str,
+    records: dict[str, StudentActivityRecord],
+    interval_rows: list[dict],
+    seating_summary: dict[str, dict],
+    fps_out: float,
+) -> list[dict]:
+    rows: list[dict] = []
+    for person_id in sorted(records.keys()):
+        record = records[person_id]
+        signal_frames = int(record.counts.get(signal_name, 0))
+        if signal_frames <= 0 and record.last_primary != signal_name:
+            continue
+        seat_info = seating_summary.get(person_id, {})
+        rows.append(
+            {
+                "record_type": "summary",
+                "person_id": person_id,
+                "track_id": record.track_id,
+                "seat_id": seat_info.get("seat_id") or "",
+                "seat_rank": seat_info.get("seat_rank") or "",
+                "row_rank": seat_info.get("row_rank") or "",
+                "weighted_avg_seat_rank": seat_info.get("weighted_avg_seat_rank") or "",
+                "signal_name": signal_name,
+                "signal_frames": signal_frames,
+                "signal_seconds": round(signal_frames / max(1e-6, fps_out), 3),
+                "last_activity_primary": record.last_primary,
+                "activity_confidence": round(record.last_confidence, 4),
+                "activity_mode": record.last_mode,
+                "activity_reason": record.last_reason,
+                "proof_keyframe": record.proof_links.get(signal_name, ""),
+            }
+        )
+    for row in interval_rows:
+        if row.get("activity_primary") != signal_name:
+            continue
+        person_id = row["person_id"]
+        seat_info = seating_summary.get(person_id, {})
+        rows.append(
+            {
+                "record_type": "interval",
+                "person_id": person_id,
+                "track_id": row.get("track_id", ""),
+                "seat_id": row.get("seat_id", "") or seat_info.get("seat_id") or "",
+                "seat_rank": seat_info.get("seat_rank") or "",
+                "row_rank": seat_info.get("row_rank") or "",
+                "weighted_avg_seat_rank": seat_info.get("weighted_avg_seat_rank") or "",
+                "signal_name": signal_name,
+                "signal_frames": "",
+                "signal_seconds": row.get("duration_seconds", 0.0),
+                "last_activity_primary": row.get("activity_primary", ""),
+                "activity_confidence": row.get("activity_confidence", 0.0),
+                "activity_mode": row.get("activity_mode", ""),
+                "activity_reason": row.get("activity_reason", ""),
+                "start_frame": row.get("start_frame", ""),
+                "end_frame": row.get("end_frame", ""),
+                "duration_seconds": row.get("duration_seconds", 0.0),
+                "proof_keyframe": row.get("proof_keyframe", ""),
+            }
+        )
+    return rows
 
 
 def _reference_box(obs: StudentObservation) -> list[float]:
@@ -514,7 +586,7 @@ def run_pipeline(args):
     activity_csv_path = Path(args.activity_out)
     proof_dir_path = Path(args.proof_dir)
     if not proof_dir_path.is_absolute():
-        proof_dir_path = activity_csv_path.parent / proof_dir_path
+        proof_dir_path = proof_dir_path if len(proof_dir_path.parts) > 1 else activity_csv_path.parent / proof_dir_path
     if proof_dir_path.exists():
         shutil.rmtree(proof_dir_path)
     proof_dir_path.mkdir(parents=True, exist_ok=True)
@@ -594,7 +666,7 @@ def run_pipeline(args):
         seat_event_engine = SeatEventEngine(
             seat_map,
             fps=fps_in,
-            initial_confirm_seconds=3.0,
+            initial_confirm_seconds=1.0,
             shift_confirm_seconds=10.0,
             out_of_class_seconds=20.0,
             exit_zone_seconds=8.0,
@@ -640,7 +712,7 @@ def run_pipeline(args):
                     {
                         "global_id": obs.global_id,
                         "track_id": obs.track_id,
-                        "center": _box_center(_reference_box(obs)).tolist(),
+                        "center": seat_anchor_point(obs.body_bbox, obs.face_bbox).tolist(),
                     }
                     for obs in observations
                 ]
@@ -763,6 +835,21 @@ def run_pipeline(args):
     if seat_event_engine is not None:
         seat_event_engine.finalize(final_frame_idx)
 
+    seating_summary = seat_event_engine.get_student_summary() if seat_event_engine is not None else {}
+    report_min_frames = max(60, int(round(fps_out * 2.0)))
+    report_min_seconds = 8.0
+    reportable_person_ids = {
+        person_id
+        for person_id, record in records.items()
+        if (
+            not str(person_id).startswith("TEMP_")
+            or (
+                record.seen_frames >= report_min_frames
+                and (record.seen_frames / max(1e-6, fps_out)) >= report_min_seconds
+            )
+        )
+    }
+
     if seat_calibration is not None and seat_reference_frame is not None:
         seat_map_json_path = activity_csv_path.parent / "seat_map.json"
         seat_map_png_path = activity_csv_path.parent / "seat_map.png"
@@ -771,6 +858,16 @@ def run_pipeline(args):
         if seat_event_engine is not None:
             timeline_path = activity_csv_path.parent / "student_seating_timeline.csv"
             event_path = activity_csv_path.parent / "attendance_events.csv"
+            timeline_rows = [
+                row
+                for row in seat_event_engine.get_timeline_rows()
+                if (
+                    row.get("student_id", "") in reportable_person_ids
+                    and row.get("state") == "seated"
+                    and row.get("seat_id")
+                    and row.get("seat_id") != "unassigned"
+                )
+            ]
             with open(timeline_path, "w", newline="", encoding="utf-8") as handle:
                 timeline_writer = csv.DictWriter(
                     handle,
@@ -787,9 +884,13 @@ def run_pipeline(args):
                     ],
                 )
                 timeline_writer.writeheader()
-                timeline_writer.writerows(seat_event_engine.get_timeline_rows())
+                timeline_writer.writerows(timeline_rows)
             with open(event_path, "w", newline="", encoding="utf-8") as handle:
-                event_rows = seat_event_engine.get_event_rows()
+                event_rows = [
+                    row
+                    for row in seat_event_engine.get_event_rows()
+                    if row.get("student_id", "") in reportable_person_ids
+                ]
                 fieldnames = sorted({key for row in event_rows for key in row.keys()}) if event_rows else [
                     "student_id",
                     "track_id",
@@ -807,7 +908,6 @@ def run_pipeline(args):
                 event_writer.writeheader()
                 event_writer.writerows(event_rows)
 
-    seating_summary = seat_event_engine.get_student_summary() if seat_event_engine is not None else {}
     interval_rows = interval_tracker.intervals
     with open(activity_csv_path, "w", newline="", encoding="utf-8") as handle:
         fieldnames = [
@@ -843,6 +943,8 @@ def run_pipeline(args):
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         for person_id in sorted(records.keys()):
+            if person_id not in reportable_person_ids:
+                continue
             record = records[person_id]
             dominant_activity, dominant_frames = max(record.counts.items(), key=lambda item: item[1])
             proof_link = record.proof_links.get(dominant_activity, "")
@@ -877,6 +979,8 @@ def run_pipeline(args):
                 }
             )
         for row in interval_rows:
+            if row["person_id"] not in reportable_person_ids:
+                continue
             seat_info = seating_summary.get(row["person_id"], {})
             writer.writerow(
                 {
@@ -901,6 +1005,57 @@ def run_pipeline(args):
                     "proof_keyframe": row["proof_keyframe"],
                 }
             )
+
+    device_rows = [row for row in _signal_rows("electronics", records, interval_rows, seating_summary, fps_out) if row.get("person_id", "") in reportable_person_ids]
+    _write_dict_rows(
+        activity_csv_path.parent / "device_use.csv",
+        [
+            "record_type",
+            "person_id",
+            "track_id",
+            "seat_id",
+            "seat_rank",
+            "row_rank",
+            "weighted_avg_seat_rank",
+            "signal_name",
+            "signal_frames",
+            "signal_seconds",
+            "last_activity_primary",
+            "activity_confidence",
+            "activity_mode",
+            "activity_reason",
+            "start_frame",
+            "end_frame",
+            "duration_seconds",
+            "proof_keyframe",
+        ],
+        device_rows,
+    )
+    note_rows = [row for row in _signal_rows("note-taking", records, interval_rows, seating_summary, fps_out) if row.get("person_id", "") in reportable_person_ids]
+    _write_dict_rows(
+        activity_csv_path.parent / "note_taking.csv",
+        [
+            "record_type",
+            "person_id",
+            "track_id",
+            "seat_id",
+            "seat_rank",
+            "row_rank",
+            "weighted_avg_seat_rank",
+            "signal_name",
+            "signal_frames",
+            "signal_seconds",
+            "last_activity_primary",
+            "activity_confidence",
+            "activity_mode",
+            "activity_reason",
+            "start_frame",
+            "end_frame",
+            "duration_seconds",
+            "proof_keyframe",
+        ],
+        note_rows,
+    )
 
     print(f"Done. Wrote {written} frames at {fps_out:.2f} FPS. Output: {args.out}")
     print(f"Activity summary saved to: {activity_csv_path}")

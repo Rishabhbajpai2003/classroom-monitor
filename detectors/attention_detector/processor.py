@@ -25,7 +25,7 @@ from app.models.seat_map import (
     save_seat_map_json,
     save_seat_map_png,
 )
-from app.models.student_backbone import SharedStudentBackbone, StudentObservation
+from app.models.student_backbone import SharedStudentBackbone, StudentObservation, seat_anchor_point
 from detectors.attention_detector.attention_engine import AttentionEngine
 
 logger = logging.getLogger(__name__)
@@ -51,6 +51,12 @@ class ClassroomProcessor:
         self.save_csv = bool(sys_cfg.get("save_csv", True))
         self.headless = bool(sys_cfg.get("headless", False))
         self.frame_skip = int(sys_cfg.get("frame_skip", 1))
+        self.report_min_frames = int(sys_cfg.get("report_min_track_frames", 12))
+        self.report_min_presence_seconds = float(sys_cfg.get("report_min_presence_seconds", 0.5))
+        self.report_min_unnamed_frames = int(sys_cfg.get("report_min_track_frames_unnamed", 60))
+        self.report_min_unnamed_presence_seconds = float(
+            sys_cfg.get("report_min_presence_seconds_unnamed", 8.0)
+        )
 
         self.phone_object_fps = float(att_cfg.get("phone_object_fps", 2.0))
         self.pose_fps = float(att_cfg.get("pose_fps", 3.0))
@@ -211,7 +217,7 @@ class ClassroomProcessor:
                     {
                         "global_id": obs.global_id,
                         "track_id": obs.track_id,
-                        "center": _box_center(ref_box).tolist(),
+                        "center": seat_anchor_point(obs.body_bbox, obs.face_bbox).tolist(),
                     }
                 )
             seat_assignments = self._seat_event_engine.update(frame_idx, projection, seat_students)
@@ -389,6 +395,8 @@ class ClassroomProcessor:
     def _save_outputs(self):
         attendance_csv_path = os.path.join(self.output_dir, "attendance_report.csv")
         self._save_attendance_report(attendance_csv_path)
+        self._save_presence_report(os.path.join(self.output_dir, "attendance_presence.csv"))
+        self._save_attention_metrics(os.path.join(self.output_dir, "attention_metrics.csv"))
         if self._seat_calibration is not None and self._reference_frame is not None:
             save_seat_map_json(
                 self._seat_map,
@@ -403,12 +411,122 @@ class ClassroomProcessor:
             )
             self._save_seating_timeline(os.path.join(self.output_dir, "student_seating_timeline.csv"))
             self._save_attendance_events(os.path.join(self.output_dir, "attendance_events.csv"))
+            self._save_seat_occupancy_shifts(os.path.join(self.output_dir, "seat_occupancy_shifts.csv"))
+            self._save_out_of_class_report(os.path.join(self.output_dir, "out_of_class_late_arrival_early_exit.csv"))
+        self._save_hand_raise_report(os.path.join(self.output_dir, "hand_raise_events.csv"))
+
+    @staticmethod
+    def _write_dict_rows(csv_path: str, fieldnames: list[str], rows: list[dict]):
+        os.makedirs(os.path.dirname(csv_path) if os.path.dirname(csv_path) else ".", exist_ok=True)
+        with open(csv_path, "w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+    def _reportable_student_ids(self) -> set[str]:
+        reportable: set[str] = set()
+        for record in self.attendance_manager.get_attendance_report():
+            student_id = str(record.get("global_id", ""))
+            total_frames = int(record.get("total_frames", 0) or 0)
+            presence_seconds = float(record.get("presence_time_seconds", 0.0) or 0.0)
+            is_temp = student_id.startswith("TEMP_")
+            if not is_temp:
+                reportable.add(student_id)
+            elif (
+                total_frames >= self.report_min_unnamed_frames
+                and presence_seconds >= self.report_min_unnamed_presence_seconds
+            ):
+                reportable.add(student_id)
+
+        if self._hand_raise_tracker is not None:
+            reportable.update(self._hand_raise_tracker.get_student_summary().keys())
+            reportable.update(row.get("student_id", "") for row in self._hand_raise_tracker.get_event_rows())
+
+        return {student_id for student_id in reportable if student_id}
+
+    def _save_presence_report(self, csv_path: str):
+        reportable = self._reportable_student_ids()
+        rows = []
+        for record in self.attendance_manager.get_attendance_report():
+            if record["global_id"] not in reportable:
+                continue
+            rows.append(
+                {
+                    "session_id": self.session_id,
+                    "camera_id": self.camera_id,
+                    "global_student_id": record["global_id"],
+                    "local_track_id": record["local_track_id"],
+                    "total_frames": record["total_frames"],
+                    "presence_time_seconds": record["presence_time_seconds"],
+                    "present": bool(record["is_present"]),
+                    "first_seen_frame": record.get("first_seen_frame", ""),
+                    "last_seen_frame": record.get("last_seen_frame", ""),
+                }
+            )
+        self._write_dict_rows(
+            csv_path,
+            [
+                "session_id",
+                "camera_id",
+                "global_student_id",
+                "local_track_id",
+                "total_frames",
+                "presence_time_seconds",
+                "present",
+                "first_seen_frame",
+                "last_seen_frame",
+            ],
+            rows,
+        )
+
+    def _save_attention_metrics(self, csv_path: str):
+        reportable = self._reportable_student_ids()
+        rows = []
+        for student_id, metrics in sorted(self.attention_engine.get_all_metrics().items()):
+            if student_id not in reportable:
+                continue
+            rows.append(
+                {
+                    "global_student_id": student_id,
+                    "attention_state": metrics.get("attention_state", "unknown"),
+                    "attention_confidence": metrics.get("attention_confidence", 0.0),
+                    "attention_mode": metrics.get("attention_mode", "limited"),
+                    "attention_reason": metrics.get("attention_reason", "no-observations"),
+                    "attentive_frames": metrics.get("attentive_frames", 0),
+                    "distracted_frames": metrics.get("distracted_frames", 0),
+                    "unknown_frames": metrics.get("unknown_frames", 0),
+                    "handraise_frames": metrics.get("handraise_frames", 0),
+                    "using_phone_frames": metrics.get("using_phone_frames", 0),
+                    "confidence_weighted_attention_score": metrics.get("confidence_weighted_score", 0.0),
+                    "attention_percentage": metrics.get("attention_percentage", 0.0),
+                }
+            )
+        self._write_dict_rows(
+            csv_path,
+            [
+                "global_student_id",
+                "attention_state",
+                "attention_confidence",
+                "attention_mode",
+                "attention_reason",
+                "attentive_frames",
+                "distracted_frames",
+                "unknown_frames",
+                "handraise_frames",
+                "using_phone_frames",
+                "confidence_weighted_attention_score",
+                "attention_percentage",
+            ],
+            rows,
+        )
 
     def _save_attendance_report(self, csv_path: str):
         attendance_data = self.attendance_manager.get_attendance_report()
         attention_data = self.attention_engine.get_all_metrics()
         seating_summary = self._seat_event_engine.get_student_summary() if self._seat_event_engine else {}
         hand_raise_summary = self._hand_raise_tracker.get_student_summary() if self._hand_raise_tracker else {}
+        reportable = self._reportable_student_ids()
         os.makedirs(os.path.dirname(csv_path) if os.path.dirname(csv_path) else ".", exist_ok=True)
         with open(csv_path, "w", newline="", encoding="utf-8") as handle:
             writer = csv.writer(handle)
@@ -445,6 +563,8 @@ class ClassroomProcessor:
             )
             for record in attendance_data:
                 student_id = record["global_id"]
+                if student_id not in reportable:
+                    continue
                 metrics = attention_data.get(
                     student_id,
                     {
@@ -499,6 +619,17 @@ class ClassroomProcessor:
     def _save_seating_timeline(self, csv_path: str):
         if self._seat_event_engine is None:
             return
+        reportable = self._reportable_student_ids()
+        rows = [
+            row
+            for row in self._seat_event_engine.get_timeline_rows()
+            if (
+                row.get("student_id", "") in reportable
+                and row.get("state") == "seated"
+                and row.get("seat_id")
+                and row.get("seat_id") != "unassigned"
+            )
+        ]
         with open(csv_path, "w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(
                 handle,
@@ -515,14 +646,17 @@ class ClassroomProcessor:
                 ],
             )
             writer.writeheader()
-            writer.writerows(self._seat_event_engine.get_timeline_rows())
+            writer.writerows(rows)
 
     def _save_attendance_events(self, csv_path: str):
         if self._seat_event_engine is None:
             return
-        rows = self._seat_event_engine.get_event_rows()
+        reportable = self._reportable_student_ids()
+        rows = [row for row in self._seat_event_engine.get_event_rows() if row.get("student_id", "") in reportable]
         if self._hand_raise_tracker is not None:
-            rows.extend(self._hand_raise_tracker.get_event_rows())
+            rows.extend(
+                row for row in self._hand_raise_tracker.get_event_rows() if row.get("student_id", "") in reportable
+            )
         with open(csv_path, "w", newline="", encoding="utf-8") as handle:
             fieldnames = sorted({key for row in rows for key in row.keys()}) if rows else [
                 "student_id",
@@ -542,6 +676,224 @@ class ClassroomProcessor:
             writer.writeheader()
             for row in rows:
                 writer.writerow(row)
+
+    def _save_seat_occupancy_shifts(self, csv_path: str):
+        if self._seat_event_engine is None:
+            self._write_dict_rows(
+                csv_path,
+                [
+                    "record_type",
+                    "student_id",
+                    "track_id",
+                    "seat_id",
+                    "seat_rank",
+                    "row_rank",
+                    "state",
+                    "start_frame",
+                    "end_frame",
+                    "duration_seconds",
+                    "from_seat",
+                    "to_seat",
+                    "reason",
+                    "confidence",
+                ],
+                [],
+            )
+            return
+        reportable = self._reportable_student_ids()
+        rows = []
+        for row in self._seat_event_engine.get_timeline_rows():
+            if (
+                row.get("student_id", "") not in reportable
+                or row.get("state") != "seated"
+                or not row.get("seat_id")
+                or row.get("seat_id") == "unassigned"
+            ):
+                continue
+            rows.append(
+                {
+                    "record_type": "occupancy_interval",
+                    "student_id": row.get("student_id", ""),
+                    "track_id": row.get("track_id", ""),
+                    "seat_id": row.get("seat_id", ""),
+                    "seat_rank": row.get("seat_rank", ""),
+                    "row_rank": row.get("row_rank", ""),
+                    "state": row.get("state", ""),
+                    "start_frame": row.get("start_frame", ""),
+                    "end_frame": row.get("end_frame", ""),
+                    "duration_seconds": row.get("duration_seconds", 0.0),
+                    "from_seat": "",
+                    "to_seat": "",
+                    "reason": "",
+                    "confidence": "",
+                }
+            )
+        for row in self._seat_event_engine.get_event_rows():
+            if row.get("student_id", "") not in reportable:
+                continue
+            if row.get("event_type") != "seat_shift":
+                continue
+            rows.append(
+                {
+                    "record_type": "seat_shift_event",
+                    "student_id": row.get("student_id", ""),
+                    "track_id": row.get("track_id", ""),
+                    "seat_id": row.get("seat_id", ""),
+                    "seat_rank": "",
+                    "row_rank": "",
+                    "state": "seat_shift",
+                    "start_frame": row.get("start_frame", ""),
+                    "end_frame": row.get("end_frame", ""),
+                    "duration_seconds": row.get("duration_seconds", 0.0),
+                    "from_seat": row.get("from_seat", ""),
+                    "to_seat": row.get("to_seat", ""),
+                    "reason": row.get("reason", ""),
+                    "confidence": row.get("confidence", ""),
+                }
+            )
+        self._write_dict_rows(
+            csv_path,
+            [
+                "record_type",
+                "student_id",
+                "track_id",
+                "seat_id",
+                "seat_rank",
+                "row_rank",
+                "state",
+                "start_frame",
+                "end_frame",
+                "duration_seconds",
+                "from_seat",
+                "to_seat",
+                "reason",
+                "confidence",
+            ],
+            rows,
+        )
+
+    def _save_out_of_class_report(self, csv_path: str):
+        seating_summary = self._seat_event_engine.get_student_summary() if self._seat_event_engine else {}
+        reportable = self._reportable_student_ids()
+        rows = []
+        for student_id, summary in sorted(seating_summary.items()):
+            if student_id not in reportable:
+                continue
+            rows.append(
+                {
+                    "record_type": "summary",
+                    "student_id": student_id,
+                    "track_id": "",
+                    "seat_id": summary.get("seat_id") or "",
+                    "event_type": "",
+                    "start_frame": "",
+                    "end_frame": "",
+                    "duration_seconds": "",
+                    "out_of_class_seconds": summary.get("out_of_class_seconds", 0.0),
+                    "late_arrival": bool(summary.get("late_arrival")),
+                    "early_exit": bool(summary.get("early_exit")),
+                    "reason": "",
+                    "confidence": "",
+                }
+            )
+        if self._seat_event_engine is not None:
+            for row in self._seat_event_engine.get_event_rows():
+                if row.get("student_id", "") not in reportable:
+                    continue
+                if row.get("event_type") not in {"out_of_class", "return_to_class", "late_arrival", "early_exit"}:
+                    continue
+                rows.append(
+                    {
+                        "record_type": "event",
+                        "student_id": row.get("student_id", ""),
+                        "track_id": row.get("track_id", ""),
+                        "seat_id": row.get("seat_id", ""),
+                        "event_type": row.get("event_type", ""),
+                        "start_frame": row.get("start_frame", ""),
+                        "end_frame": row.get("end_frame", ""),
+                        "duration_seconds": row.get("duration_seconds", 0.0),
+                        "out_of_class_seconds": "",
+                        "late_arrival": row.get("event_type") == "late_arrival",
+                        "early_exit": row.get("event_type") == "early_exit",
+                        "reason": row.get("reason", ""),
+                        "confidence": row.get("confidence", ""),
+                    }
+                )
+        self._write_dict_rows(
+            csv_path,
+            [
+                "record_type",
+                "student_id",
+                "track_id",
+                "seat_id",
+                "event_type",
+                "start_frame",
+                "end_frame",
+                "duration_seconds",
+                "out_of_class_seconds",
+                "late_arrival",
+                "early_exit",
+                "reason",
+                "confidence",
+            ],
+            rows,
+        )
+
+    def _save_hand_raise_report(self, csv_path: str):
+        rows = []
+        summary = self._hand_raise_tracker.get_student_summary() if self._hand_raise_tracker else {}
+        reportable = self._reportable_student_ids()
+        for student_id, info in sorted(summary.items()):
+            if student_id not in reportable:
+                continue
+            rows.append(
+                {
+                    "record_type": "summary",
+                    "student_id": student_id,
+                    "track_id": "",
+                    "seat_id": "",
+                    "hand_raise_count": info.get("hand_raise_count", 0),
+                    "hand_raise_seconds": info.get("hand_raise_seconds", 0.0),
+                    "start_frame": "",
+                    "end_frame": "",
+                    "duration_seconds": "",
+                    "peak_confidence": "",
+                }
+            )
+        if self._hand_raise_tracker is not None:
+            for row in self._hand_raise_tracker.get_event_rows():
+                if row.get("student_id", "") not in reportable:
+                    continue
+                rows.append(
+                    {
+                        "record_type": "event",
+                        "student_id": row.get("student_id", ""),
+                        "track_id": row.get("track_id", ""),
+                        "seat_id": row.get("seat_id", ""),
+                        "hand_raise_count": "",
+                        "hand_raise_seconds": "",
+                        "start_frame": row.get("start_frame", ""),
+                        "end_frame": row.get("end_frame", ""),
+                        "duration_seconds": row.get("duration_seconds", 0.0),
+                        "peak_confidence": row.get("peak_confidence", ""),
+                    }
+                )
+        self._write_dict_rows(
+            csv_path,
+            [
+                "record_type",
+                "student_id",
+                "track_id",
+                "seat_id",
+                "hand_raise_count",
+                "hand_raise_seconds",
+                "start_frame",
+                "end_frame",
+                "duration_seconds",
+                "peak_confidence",
+            ],
+            rows,
+        )
 
     def _print_session_summary(
         self,
@@ -584,4 +936,3 @@ class ClassroomProcessor:
         if self._seat_event_engine is not None:
             print(f"  Seat Map        : enabled ({len(self._seat_map)} seats)")
         print(f"{'=' * 60}\n")
-

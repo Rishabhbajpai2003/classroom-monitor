@@ -56,7 +56,7 @@ def parse_args():
     parser.add_argument("--tile_grid", type=int, default=2, help="Tile grid for person/object detection.")
     parser.add_argument("--tile_overlap", type=float, default=0.20, help="Tile overlap ratio.")
 
-    parser.add_argument("--track_fps", type=float, default=5.0, help="Face/body tracking rate.")
+    parser.add_argument("--track_fps", type=float, default=8.0, help="Face/body tracking rate.")
     parser.add_argument("--object_fps", type=float, default=3.0, help="Object detection rate.")
     parser.add_argument("--pose_fps", type=float, default=2.5, help="Pose refresh rate.")
 

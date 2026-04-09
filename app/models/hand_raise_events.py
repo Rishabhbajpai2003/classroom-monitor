@@ -19,10 +19,17 @@ class HandRaiseEvent:
 
 
 class HandRaiseEventTracker:
-    def __init__(self, fps: float, min_hold_seconds: float = 0.5, release_seconds: float = 0.5):
+    def __init__(
+        self,
+        fps: float,
+        min_hold_seconds: float = 0.8,
+        release_seconds: float = 0.4,
+        min_peak_confidence: float = 0.55,
+    ):
         self.fps = max(1e-6, float(fps))
         self.min_hold_frames = max(1, int(round(min_hold_seconds * self.fps)))
         self.release_frames = max(1, int(round(release_seconds * self.fps)))
+        self.min_peak_confidence = float(min_peak_confidence)
         self.state: dict[str, dict] = {}
         self.events: list[HandRaiseEvent] = []
 
@@ -58,17 +65,18 @@ class HandRaiseEventTracker:
             if state["release_start"] is None:
                 state["release_start"] = frame_idx
             elif frame_idx - state["release_start"] + 1 >= self.release_frames:
-                self.events.append(
-                    HandRaiseEvent(
-                        student_id=student_id,
-                        track_id=int(state["track_id"]),
-                        seat_id=str(state["seat_id"] or ""),
-                        start_frame=int(state["active_start"]),
-                        end_frame=max(int(state["active_start"]), frame_idx - self.release_frames),
-                        duration_seconds=max(0.0, (frame_idx - self.release_frames - int(state["active_start"]) + 1) / self.fps),
-                        peak_confidence=float(state["peak_confidence"]),
+                if float(state["peak_confidence"]) >= self.min_peak_confidence:
+                    self.events.append(
+                        HandRaiseEvent(
+                            student_id=student_id,
+                            track_id=int(state["track_id"]),
+                            seat_id=str(state["seat_id"] or ""),
+                            start_frame=int(state["active_start"]),
+                            end_frame=max(int(state["active_start"]), frame_idx - self.release_frames),
+                            duration_seconds=max(0.0, (frame_idx - self.release_frames - int(state["active_start"]) + 1) / self.fps),
+                            peak_confidence=float(state["peak_confidence"]),
+                        )
                     )
-                )
                 state["active_start"] = None
                 state["release_start"] = None
                 state["peak_confidence"] = 0.0
@@ -77,17 +85,18 @@ class HandRaiseEventTracker:
         for student_id, state in self.state.items():
             if state.get("active_start") is None:
                 continue
-            self.events.append(
-                HandRaiseEvent(
-                    student_id=student_id,
-                    track_id=int(state["track_id"]),
-                    seat_id=str(state["seat_id"] or ""),
-                    start_frame=int(state["active_start"]),
-                    end_frame=max(int(state["active_start"]), int(total_frames)),
-                    duration_seconds=max(0.0, (int(total_frames) - int(state["active_start"]) + 1) / self.fps),
-                    peak_confidence=float(state["peak_confidence"]),
+            if float(state["peak_confidence"]) >= self.min_peak_confidence:
+                self.events.append(
+                    HandRaiseEvent(
+                        student_id=student_id,
+                        track_id=int(state["track_id"]),
+                        seat_id=str(state["seat_id"] or ""),
+                        start_frame=int(state["active_start"]),
+                        end_frame=max(int(state["active_start"]), int(total_frames)),
+                        duration_seconds=max(0.0, (int(total_frames) - int(state["active_start"]) + 1) / self.fps),
+                        peak_confidence=float(state["peak_confidence"]),
+                    )
                 )
-            )
             state["active_start"] = None
 
     def get_event_rows(self) -> list[dict]:
@@ -117,4 +126,3 @@ class HandRaiseEventTracker:
         for entry in summary.values():
             entry["hand_raise_seconds"] = round(entry["hand_raise_seconds"], 3)
         return summary
-
