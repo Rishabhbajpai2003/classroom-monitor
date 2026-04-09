@@ -499,6 +499,52 @@ class FaceTracker:
         self.next_temp_track_id = -1
         self.tracks: Dict[int, Track] = {}
         self.archived_tracks: Dict[int, Track] = {}
+        self.identity_aliases: Dict[int, int] = {}
+
+    def resolve_track_id(self, track_id: int) -> int:
+        current = int(track_id)
+        visited: List[int] = []
+        while current in self.identity_aliases and current not in visited:
+            visited.append(current)
+            current = int(self.identity_aliases[current])
+        for item in visited:
+            self.identity_aliases[item] = current
+        return current
+
+    def get_track_by_any_id(self, track_id: int) -> Optional[Track]:
+        resolved_track_id = self.resolve_track_id(track_id)
+        track = self.tracks.get(resolved_track_id)
+        if track is not None:
+            return track
+        return self.archived_tracks.get(resolved_track_id)
+
+    def _record_identity_alias(self, source_track_id: int, target_track_id: int) -> None:
+        source_resolved = self.resolve_track_id(source_track_id)
+        target_resolved = self.resolve_track_id(target_track_id)
+        if source_resolved == target_resolved:
+            return
+        self.identity_aliases[source_resolved] = target_resolved
+
+    @staticmethod
+    def _merge_track_metadata(target_track: Track, source_track: Track) -> None:
+        source_metadata = dict(source_track.metadata or {})
+        if not source_metadata:
+            return
+        if not target_track.metadata:
+            target_track.metadata = {}
+        target_metadata = target_track.metadata
+        for key, value in source_metadata.items():
+            if value in (None, "", [], {}):
+                continue
+            if key in {"seed_sources", "source_images"}:
+                current = list(target_metadata.get(key, []) or [])
+                for item in list(value):
+                    if item not in current:
+                        current.append(item)
+                target_metadata[key] = current
+                continue
+            if not target_metadata.get(key):
+                target_metadata[key] = value
 
     def _match_by_score_matrix(
         self,
@@ -569,6 +615,11 @@ class FaceTracker:
                 if track_id <= 0:
                     continue
                 if track.avg_embedding is None or track.hits < self.min_confirm_hits:
+                    continue
+                metadata = dict(track.metadata or {})
+                student_name = str(metadata.get("name", "") or "").strip()
+                student_key = str(metadata.get("student_key", "") or "").strip()
+                if not student_name and not student_key:
                     continue
                 track.persistent_identity = True
                 tracks[track_id] = track
@@ -777,6 +828,8 @@ class FaceTracker:
     def _merge_track_into_archived_identity(self, young_track_id: int, archived_track_id: int, frame_idx: int) -> None:
         young_track = self.tracks.pop(young_track_id)
         restored_track = self.archived_tracks.pop(archived_track_id)
+        self._record_identity_alias(young_track_id, archived_track_id)
+        self._merge_track_metadata(restored_track, young_track)
 
         for emb in young_track.embeddings:
             restored_track.update_embedding_bank(emb, sample_quality=young_track.best_embedding_quality)
@@ -797,6 +850,8 @@ class FaceTracker:
         target_track = self.tracks.get(active_track_id)
         if target_track is None:
             return
+        self._record_identity_alias(young_track_id, active_track_id)
+        self._merge_track_metadata(target_track, young_track)
 
         for emb in young_track.embeddings:
             target_track.update_embedding_bank(emb, sample_quality=young_track.best_embedding_quality)
@@ -1236,13 +1291,25 @@ class FaceIdentityDB:
 # -----------------------------
 
 def draw_track(frame: np.ndarray, track: Track) -> None:
-    x1, y1, x2, y2 = track.bbox.astype(int)
-    color = color_from_id(track.track_id)
+    draw_track_annotation(frame, track.bbox, track.track_id, track.hits, track.metadata)
+
+
+def draw_track_annotation(
+    frame: np.ndarray,
+    bbox: np.ndarray,
+    track_id: int,
+    hits: int,
+    metadata: Optional[Dict[str, object]] = None,
+) -> None:
+    x1, y1, x2, y2 = np.asarray(bbox, dtype=np.float32).astype(int)
+    color = color_from_id(track_id)
 
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-    label = f"Student {track.track_id}" if track.track_id > 0 else "Student"
+    resolved_metadata = dict(metadata or {})
+    student_name = str(resolved_metadata.get("name", "") or "").strip()
+    label = student_name if student_name else "Unknown"
 
-    if track.hits < 2 or track.track_id <= 0:
+    if not student_name and (hits < 2 or track_id <= 0):
         label += " ?"
 
     (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
@@ -1275,9 +1342,71 @@ class CsvLogger:
                 t.hits, t.first_frame_idx, t.last_frame_idx
             ])
 
+    def log_annotations(self, frame_idx: int, annotations: List[Dict[str, object]]) -> None:
+        if not self.writer:
+            return
+        for item in annotations:
+            bbox = np.asarray(item.get("bbox"), dtype=np.float32).tolist()
+            if len(bbox) != 4:
+                continue
+            x1, y1, x2, y2 = bbox
+            self.writer.writerow([
+                frame_idx,
+                int(item.get("student_id", 0)),
+                f"{x1:.2f}",
+                f"{y1:.2f}",
+                f"{x2:.2f}",
+                f"{y2:.2f}",
+                int(item.get("hits", 0)),
+                int(item.get("first_frame_idx", frame_idx)),
+                int(item.get("last_frame_idx", frame_idx)),
+            ])
+
     def close(self) -> None:
         if self.file:
             self.file.close()
+
+
+def build_frame_annotation(tracker: FaceTracker, frame_idx: int, visible_tracks: List[Track]) -> Dict[str, object]:
+    active_identity_count = sum(1 for track in tracker.tracks.values() if track.track_id > 0)
+    annotations: List[Dict[str, object]] = []
+    for track in visible_tracks:
+        annotations.append(
+            {
+                "raw_track_id": int(track.track_id),
+                "bbox": np.asarray(track.bbox, dtype=np.float32).tolist(),
+                "hits": int(track.hits),
+                "first_frame_idx": int(track.first_frame_idx),
+                "last_frame_idx": int(track.last_frame_idx),
+            }
+        )
+    return {
+        "frame_idx": int(frame_idx),
+        "visible_count": len(visible_tracks),
+        "active_identity_count": active_identity_count,
+        "tracks": annotations,
+    }
+
+
+def resolved_frame_annotations(tracker: FaceTracker, frame_payload: Dict[str, object]) -> List[Dict[str, object]]:
+    resolved_items: List[Dict[str, object]] = []
+    for item in list(frame_payload.get("tracks", [])):
+        raw_track_id = int(item.get("raw_track_id", 0))
+        resolved_track_id = tracker.resolve_track_id(raw_track_id)
+        resolved_track = tracker.get_track_by_any_id(raw_track_id)
+        metadata = dict(resolved_track.metadata or {}) if resolved_track is not None else {}
+        resolved_items.append(
+            {
+                "raw_track_id": raw_track_id,
+                "student_id": resolved_track_id,
+                "bbox": item.get("bbox", []),
+                "hits": int(item.get("hits", 0)),
+                "first_frame_idx": int(item.get("first_frame_idx", frame_payload.get("frame_idx", 0))),
+                "last_frame_idx": int(item.get("last_frame_idx", frame_payload.get("frame_idx", 0))),
+                "metadata": metadata,
+            }
+        )
+    return resolved_items
 
 
 # -----------------------------
@@ -1411,15 +1540,10 @@ def main() -> None:
     process_period_frames = max(1.0, fps / max(1e-6, process_fps))
     next_process_frame = 0.0
 
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    ensure_parent_dir(args.output)
-    writer = cv2.VideoWriter(args.output, fourcc, process_fps, (width, height))
-    if not writer.isOpened():
-        raise RuntimeError(f"Could not open video writer for: {args.output}")
-
     frame_idx = 0
     processed_frame_count = 0
     saved_identity_count = loaded_identity_count
+    frame_history: List[Dict[str, object]] = []
     try:
         while True:
             ok, frame = cap.read()
@@ -1435,32 +1559,28 @@ def main() -> None:
 
             detections = backend.infer(frame)
             visible_tracks = tracker.step(detections, frame_idx)
-
-            for track in visible_tracks:
-                draw_track(frame, track)
-
-            # Overlay simple stats.
-            active_identity_count = sum(1 for track in tracker.tracks.values() if track.track_id > 0)
-            cv2.putText(
-                frame,
-                f"Frame: {frame_idx} | Visible students: {len(visible_tracks)} | Active IDs: {active_identity_count}",
-                (10, 28),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 255, 255),
-                2,
-                cv2.LINE_AA,
-            )
-
-            writer.write(frame)
-            csv_logger.log(frame_idx, visible_tracks)
+            frame_history.append(build_frame_annotation(tracker, frame_idx, visible_tracks))
             processed_frame_count += 1
 
             if args.identity_db_save_every > 0 and frame_idx > 0 and frame_idx % args.identity_db_save_every == 0:
                 saved_identity_count = identity_db.save(tracker)
 
             if args.display:
-                cv2.imshow("Classroom Face Tracker", frame)
+                preview = frame.copy()
+                for track in visible_tracks:
+                    draw_track(preview, track)
+                active_identity_count = sum(1 for track in tracker.tracks.values() if track.track_id > 0)
+                cv2.putText(
+                    preview,
+                    f"Frame: {frame_idx} | Visible students: {len(visible_tracks)} | Active IDs: {active_identity_count}",
+                    (10, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+                cv2.imshow("Classroom Face Tracker", preview)
                 key = cv2.waitKey(1) & 0xFF
                 if key == 27 or key == ord("q"):
                     break
@@ -1477,10 +1597,71 @@ def main() -> None:
     finally:
         saved_identity_count = identity_db.save(tracker)
         cap.release()
-        writer.release()
-        csv_logger.close()
         if args.display:
             cv2.destroyAllWindows()
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    ensure_parent_dir(args.output)
+    writer = cv2.VideoWriter(args.output, fourcc, process_fps, (width, height))
+    if not writer.isOpened():
+        csv_logger.close()
+        raise RuntimeError(f"Could not open video writer for: {args.output}")
+
+    cap = cv2.VideoCapture(args.input)
+    if not cap.isOpened():
+        writer.release()
+        csv_logger.close()
+        raise RuntimeError(f"Could not reopen video for rendering: {args.input}")
+
+    frame_history_by_idx = {int(item["frame_idx"]): item for item in frame_history}
+    frame_idx = 0
+    next_process_frame = 0.0
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if args.max_frames > 0 and frame_idx >= args.max_frames:
+                break
+
+            if frame_idx + 1e-6 < next_process_frame:
+                frame_idx += 1
+                continue
+            next_process_frame += process_period_frames
+
+            frame_payload = frame_history_by_idx.get(frame_idx)
+            if frame_payload is None:
+                frame_idx += 1
+                continue
+
+            resolved_tracks = resolved_frame_annotations(tracker, frame_payload)
+            for item in resolved_tracks:
+                draw_track_annotation(
+                    frame,
+                    np.asarray(item.get("bbox", []), dtype=np.float32),
+                    int(item.get("student_id", 0)),
+                    int(item.get("hits", 0)),
+                    item.get("metadata", {}),
+                )
+
+            cv2.putText(
+                frame,
+                f"Frame: {frame_idx} | Visible students: {int(frame_payload.get('visible_count', 0))} | Active IDs: {int(frame_payload.get('active_identity_count', 0))}",
+                (10, 28),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+
+            writer.write(frame)
+            csv_logger.log_annotations(frame_idx, resolved_tracks)
+            frame_idx += 1
+    finally:
+        cap.release()
+        writer.release()
+        csv_logger.close()
 
     print(f"Done. Output video saved to: {args.output}")
     print(f"Persistent identity DB saved to: {args.identity_db} ({saved_identity_count} identities)")
