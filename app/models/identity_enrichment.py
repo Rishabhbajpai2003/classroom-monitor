@@ -19,6 +19,10 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b))
 
 
+def clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
+
+
 def weighted_average_embeddings(vectors: Sequence[np.ndarray], qualities: Sequence[float]) -> Optional[np.ndarray]:
     if not vectors:
         return None
@@ -64,6 +68,31 @@ def infer_size_bucket(face_size: float) -> str:
     return "large_face"
 
 
+def infer_lighting_bucket(mean_brightness: float, shadow_severity: float = 0.0) -> str:
+    brightness = float(mean_brightness)
+    shadow = float(shadow_severity)
+    if brightness < 70.0 or shadow >= 0.48:
+        return "low_light"
+    if brightness > 180.0:
+        return "bright_light"
+    return "balanced_light"
+
+
+def normalize_bank_family(metadata: Optional[Dict[str, object]] = None) -> str:
+    cleaned = dict(metadata or {})
+    combo = str(cleaned.get("combination_tag", "") or "").strip()
+    if combo:
+        return f"combo/{combo}"
+
+    family = str(cleaned.get("augmentation_family", "") or "").strip()
+    tag = str(cleaned.get("augmentation_tag", "") or "").strip()
+    if family and tag:
+        return f"{family}/{tag}"
+    if family:
+        return family
+    return "base"
+
+
 def infer_profile_bucket(bbox: Sequence[float], landmarks: Optional[np.ndarray]) -> str:
     if landmarks is None or len(landmarks) < 3:
         return "frontal"
@@ -107,6 +136,14 @@ def sanitize_embedding_metadata(
     if not size:
         size = infer_size_bucket(float(cleaned.get("face_size", 0.0) or 0.0))
     cleaned["size_bucket"] = size
+    cleaned["detector_used"] = str(cleaned.get("detector_used", "") or "scrfd").strip() or "scrfd"
+    cleaned["embedder_used"] = str(cleaned.get("embedder_used", "") or "arcface").strip() or "arcface"
+    cleaned["lighting_bucket"] = str(cleaned.get("lighting_bucket", "") or "balanced_light").strip() or "balanced_light"
+    cleaned["generator_type"] = str(cleaned.get("generator_type", "") or "base").strip() or "base"
+    cleaned["augmentation_family"] = str(cleaned.get("augmentation_family", "") or "").strip()
+    cleaned["augmentation_tag"] = str(cleaned.get("augmentation_tag", "") or "").strip()
+    cleaned["combination_tag"] = str(cleaned.get("combination_tag", "") or "").strip()
+    cleaned["bank_family"] = str(cleaned.get("bank_family", "") or normalize_bank_family(cleaned)).strip() or "base"
     cleaned["added_at"] = str(cleaned.get("added_at", "") or added_at or current_utc_iso())
     return cleaned
 
@@ -126,8 +163,8 @@ def _record_sort_key(record: EmbeddingRecord) -> Tuple[float, float, float]:
 
 def _bucket_key(metadata: Dict[str, object]) -> Tuple[str, str]:
     return (
-        str(metadata.get("profile_bucket", "frontal") or "frontal"),
-        str(metadata.get("size_bucket", "medium_face") or "medium_face"),
+        str(metadata.get("bank_family", "base") or "base"),
+        f"{str(metadata.get('embedder_used', 'arcface') or 'arcface')}|{str(metadata.get('profile_bucket', 'frontal') or 'frontal')}|{str(metadata.get('size_bucket', 'medium_face') or 'medium_face')}",
     )
 
 
@@ -229,6 +266,69 @@ def summarize_embedding_bank(
     return avg_embedding, best_embedding, float(qualities[best_idx]), recent_embedding
 
 
+def _summary_payload(
+    embeddings: Sequence[np.ndarray],
+    qualities: Sequence[float],
+    metadata_list: Sequence[Dict[str, object]],
+) -> Dict[str, object]:
+    avg_embedding, best_embedding, best_quality, recent_embedding = summarize_embedding_bank(
+        embeddings,
+        qualities,
+        metadata_list,
+    )
+    return {
+        "count": len(embeddings),
+        "avg_embedding": None if avg_embedding is None else avg_embedding.copy(),
+        "best_embedding": None if best_embedding is None else best_embedding.copy(),
+        "recent_embedding": None if recent_embedding is None else recent_embedding.copy(),
+        "best_quality": float(best_quality),
+    }
+
+
+def build_grouped_embedding_summaries(
+    embeddings: Sequence[np.ndarray],
+    qualities: Sequence[float],
+    metadata_list: Sequence[Dict[str, object]],
+) -> Dict[str, Dict[str, object]]:
+    grouped: Dict[str, Dict[str, List[object]]] = {}
+    for idx, emb in enumerate(embeddings):
+        quality = float(qualities[idx]) if idx < len(qualities) else 0.5
+        metadata = sanitize_embedding_metadata(
+            metadata_list[idx] if idx < len(metadata_list) else {},
+            quality=quality,
+        )
+        bank_family = str(metadata.get("bank_family", "base") or "base")
+        embedder_used = str(metadata.get("embedder_used", "arcface") or "arcface")
+        family_bucket = grouped.setdefault(bank_family, {})
+        family_bucket.setdefault("_embeddings", []).append(l2_normalize(np.asarray(emb, dtype=np.float32)))
+        family_bucket.setdefault("_qualities", []).append(quality)
+        family_bucket.setdefault("_metadata", []).append(metadata)
+        per_embedder = family_bucket.setdefault("_per_embedder", {})
+        embedder_bucket = per_embedder.setdefault(embedder_used, {"embeddings": [], "qualities": [], "metadata": []})
+        embedder_bucket["embeddings"].append(l2_normalize(np.asarray(emb, dtype=np.float32)))
+        embedder_bucket["qualities"].append(quality)
+        embedder_bucket["metadata"].append(metadata)
+
+    summaries: Dict[str, Dict[str, object]] = {}
+    for bank_family, bucket in grouped.items():
+        family_embeddings = bucket["_embeddings"]
+        family_qualities = bucket["_qualities"]
+        family_metadata = bucket["_metadata"]
+        per_embedder_payload: Dict[str, Dict[str, object]] = {}
+        for embedder_used, embedder_bucket in bucket["_per_embedder"].items():
+            per_embedder_payload[embedder_used] = _summary_payload(
+                embedder_bucket["embeddings"],
+                embedder_bucket["qualities"],
+                embedder_bucket["metadata"],
+            )
+        summaries[bank_family] = {
+            "count": len(family_embeddings),
+            "global": _summary_payload(family_embeddings, family_qualities, family_metadata),
+            "per_embedder": per_embedder_payload,
+        }
+    return summaries
+
+
 def bank_match_score(
     probe_embedding: np.ndarray,
     avg_embedding: Optional[np.ndarray],
@@ -256,6 +356,31 @@ def bank_match_score(
         scores.append(cosine_similarity(probe, l2_normalize(np.asarray(best_embedding, dtype=np.float32))))
     best_bank = max(scores)
     return float(0.55 * best_bank + 0.45 * avg_sim)
+
+
+def grouped_bank_match_score(
+    probe_embedding: np.ndarray,
+    group_summary: Optional[Dict[str, object]],
+) -> float:
+    if not group_summary:
+        return -1.0
+    probe = l2_normalize(np.asarray(probe_embedding, dtype=np.float32))
+    avg_embedding = group_summary.get("avg_embedding")
+    best_embedding = group_summary.get("best_embedding")
+    recent_embedding = group_summary.get("recent_embedding")
+    best_quality = float(group_summary.get("best_quality", 0.0) or 0.0)
+    if avg_embedding is None:
+        return -1.0
+
+    avg_sim = cosine_similarity(probe, l2_normalize(np.asarray(avg_embedding, dtype=np.float32)))
+    scores = [avg_sim]
+    if recent_embedding is not None:
+        scores.append(0.97 * cosine_similarity(probe, l2_normalize(np.asarray(recent_embedding, dtype=np.float32))))
+    if best_embedding is not None:
+        scores.append(cosine_similarity(probe, l2_normalize(np.asarray(best_embedding, dtype=np.float32))))
+    best_bank = max(scores)
+    quality_bonus = 0.02 * clamp(best_quality, 0.0, 1.0)
+    return float(0.55 * best_bank + 0.45 * avg_sim + quality_bonus)
 
 
 def classify_harvest_candidate(

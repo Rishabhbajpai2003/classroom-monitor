@@ -64,6 +64,13 @@ class TrackSample:
     profile_bucket: str
     size_bucket: str
     face_size: float
+    detector_used: str
+    embedder_used: str
+    lighting_bucket: str
+    sharpness: float
+    brightness: float
+    shadow_severity: float
+    occlusion_ratio: float
 
 
 @dataclass
@@ -143,6 +150,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tile-grid", type=int, default=3, help="Tiled detection grid for offline harvest.")
     parser.add_argument("--tile-overlap", type=float, default=0.22, help="Tile overlap ratio for harvest.")
     parser.add_argument("--min-face", type=int, default=8, help="Minimum face size in pixels.")
+    parser.add_argument("--primary-detector", default="scrfd", help="Primary detector label used in metadata.")
+    parser.add_argument("--backup-detector", default="retinaface", help="Backup detector label used in metadata.")
+    parser.add_argument("--disable-backup-detector", action="store_true", help="Disable the backup detector pass.")
+    parser.add_argument("--adaface-weights", default="", help="Optional AdaFace ONNX weights.")
     parser.add_argument("--sim-thresh", type=float, default=0.45, help="Active track association threshold.")
     parser.add_argument("--ttl", type=int, default=140, help="Missing-track TTL in frames.")
     parser.add_argument("--archive-ttl", type=int, default=2400, help="Archived-track TTL in frames.")
@@ -260,6 +271,7 @@ def bbox_to_crop(frame: np.ndarray, bbox: Sequence[float], pad_ratio: float = 0.
 def build_sample_from_observation(observation: TrackObservation, process_fps: float) -> TrackSample:
     bbox = np.asarray(observation.bbox, dtype=np.float32)
     face_size = float(max(0.0, min(float(bbox[2] - bbox[0]), float(bbox[3] - bbox[1]))))
+    quality_profile = dict(observation.quality_profile or {})
     return TrackSample(
         raw_track_id=int(observation.raw_track_id),
         frame_idx=int(observation.frame_idx),
@@ -271,6 +283,13 @@ def build_sample_from_observation(observation: TrackObservation, process_fps: fl
         profile_bucket=infer_profile_bucket(bbox, observation.landmarks),
         size_bucket=infer_size_bucket(face_size),
         face_size=face_size,
+        detector_used=str(observation.detector_used or "scrfd"),
+        embedder_used=str(observation.embedder_used or "arcface"),
+        lighting_bucket=str(quality_profile.get("lighting_bucket", "balanced_light")),
+        sharpness=float(quality_profile.get("sharpness", 0.0) or 0.0),
+        brightness=float(quality_profile.get("brightness", 0.0) or 0.0),
+        shadow_severity=float(quality_profile.get("shadow_severity", 0.0) or 0.0),
+        occlusion_ratio=float(quality_profile.get("occlusion_ratio", 0.0) or 0.0),
     )
 
 
@@ -301,6 +320,14 @@ def merge_samples_into_track(
                 "face_size": float(sample.face_size),
                 "profile_bucket": sample.profile_bucket,
                 "size_bucket": sample.size_bucket,
+                "lighting_bucket": sample.lighting_bucket,
+                "sharpness": float(sample.sharpness),
+                "brightness": float(sample.brightness),
+                "shadow_severity": float(sample.shadow_severity),
+                "occlusion_ratio": float(sample.occlusion_ratio),
+                "detector_used": sample.detector_used,
+                "embedder_used": sample.embedder_used,
+                "source_token": f"{phase}:{video_path.name}:{int(sample.raw_track_id)}:{int(sample.frame_idx)}:{sample.embedder_used}",
                 "added_at": current_utc_iso(),
             },
             max_bank=max_bank,
@@ -655,6 +682,10 @@ def main() -> None:
         det_thresh=args.det_thresh,
         tile_grid=args.tile_grid,
         tile_overlap=args.tile_overlap,
+        primary_detector_name=args.primary_detector,
+        backup_detector_name=args.backup_detector,
+        enable_backup_detector=not bool(args.disable_backup_detector),
+        adaface_weights=args.adaface_weights or None,
     )
 
     all_decisions: list[VideoDecision] = []

@@ -1,0 +1,28 @@
+name: classroom_monitoring
+description: Classroom Monitoring and Tracking System - A Flutter application for attendance tracking and classroom management.
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.6
+  fl_chart: ^0.66.0
+  intl: ^0.18.1
+  http: ^1.2.0
+  google_fonts: ^6.1.0
+  supabase_flutter: ^2.12.2
+  video_player: ^2.8.2
+  chewie: ^1.7.1
+  data_table_2: ^2.5.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true

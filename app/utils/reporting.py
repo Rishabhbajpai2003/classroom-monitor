@@ -6,6 +6,8 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Iterable
 
+from app.models.roster_policy import capped_reportable_ids, roster_size
+
 
 def _safe_float(value, default: float = 0.0) -> float:
     try:
@@ -266,6 +268,20 @@ def build_final_student_summary(run_dir: Path, identity_db_path: Path, fps: floa
             out["unknown_topic_segments"] = int(out.get("unknown_topic_segments", 0) or 0) + 1
 
     summary_path = run_dir / "final_student_summary.csv"
+    roster_limit = roster_size("student-details")
+    ordered_student_ids = sorted(table.keys())
+    if roster_limit > 0:
+        named_ids = [student_id for student_id in ordered_student_ids if not str(student_id).startswith("TEMP_")]
+        unnamed_candidates = []
+        for student_id in ordered_student_ids:
+            if not str(student_id).startswith("TEMP_"):
+                continue
+            row = table.get(student_id, {})
+            score = _safe_float(row.get("presence_time_seconds"), 0.0) + _safe_float(row.get("attention_confidence"), 0.0)
+            unnamed_candidates.append((student_id, score))
+        selected_ids = capped_reportable_ids(named_ids, unnamed_candidates, roster_limit=roster_limit)
+    else:
+        selected_ids = set(ordered_student_ids)
     fieldnames = [
         "global_student_id",
         "display_name",
@@ -306,6 +322,8 @@ def build_final_student_summary(run_dir: Path, identity_db_path: Path, fps: floa
     with summary_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
-        for student_id in sorted(table.keys()):
+        for student_id in ordered_student_ids:
+            if student_id not in selected_ids:
+                continue
             writer.writerow({key: table[student_id].get(key, "") for key in fieldnames})
     return summary_path

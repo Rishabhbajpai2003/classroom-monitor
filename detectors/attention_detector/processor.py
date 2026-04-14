@@ -17,6 +17,7 @@ from app.models.attendance_manager import AttendanceManager
 from app.models.detectors import OpenVocabularyObjectDetector, PersonDetector, bbox_iou
 from app.models.hand_raise_events import HandRaiseEventTracker
 from app.models.pose_analyzer import PoseAnalyzer
+from app.models.roster_policy import capped_reportable_ids, roster_size
 from app.models.seat_events import SeatEventEngine
 from app.models.seat_map import (
     CameraMotionCompensator,
@@ -49,6 +50,7 @@ class ClassroomProcessor:
         att_cfg = self.config.get("attention", {})
         seating_cfg = self.config.get("seating", {})
         event_cfg = self.config.get("attendance_events", {})
+        roster_cfg = self.config.get("roster_policy", {})
 
         self.camera_id = sys_cfg.get("camera_id", "cam_01")
         self.session_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{self.camera_id}"
@@ -67,6 +69,8 @@ class ClassroomProcessor:
         self.overlay_min_unnamed_presence_seconds = float(
             sys_cfg.get("overlay_min_presence_seconds_unnamed", 3.0)
         )
+        self.roster_cap_enabled = bool(roster_cfg.get("hard_cap_reportable_identities", True))
+        self.roster_limit = roster_size(roster_cfg.get("student_details_root", "student-details"))
 
         self.phone_object_fps = float(att_cfg.get("phone_object_fps", 2.0))
         self.pose_fps = float(att_cfg.get("pose_fps", 3.0))
@@ -343,6 +347,8 @@ class ClassroomProcessor:
         )
 
     def _should_render_student_overlay(self, student_id: str, seat_id: str | None = None) -> bool:
+        if self.roster_cap_enabled and self.roster_limit > 0 and student_id not in self._reportable_student_ids():
+            return False
         if not str(student_id).startswith("TEMP_"):
             return True
         record = self.attendance_manager.records.get(student_id)
@@ -474,25 +480,39 @@ class ClassroomProcessor:
                 writer.writerow({key: row.get(key, "") for key in fieldnames})
 
     def _reportable_student_ids(self) -> set[str]:
-        reportable: set[str] = set()
+        reportable_named: list[str] = []
+        unnamed_candidates: list[tuple[str, float]] = []
         for record in self.attendance_manager.get_attendance_report():
             student_id = str(record.get("global_id", ""))
             total_frames = int(record.get("total_frames", 0) or 0)
             presence_seconds = float(record.get("presence_time_seconds", 0.0) or 0.0)
             is_temp = student_id.startswith("TEMP_")
             if not is_temp:
-                reportable.add(student_id)
+                reportable_named.append(student_id)
             elif (
                 total_frames >= self.report_min_unnamed_frames
                 and presence_seconds >= self.report_min_unnamed_presence_seconds
             ):
-                reportable.add(student_id)
+                unnamed_candidates.append((student_id, total_frames + presence_seconds))
 
         if self._hand_raise_tracker is not None:
-            reportable.update(self._hand_raise_tracker.get_student_summary().keys())
-            reportable.update(row.get("student_id", "") for row in self._hand_raise_tracker.get_event_rows())
+            for student_id in self._hand_raise_tracker.get_student_summary().keys():
+                if student_id and not str(student_id).startswith("TEMP_"):
+                    reportable_named.append(str(student_id))
+            for row in self._hand_raise_tracker.get_event_rows():
+                student_id = str(row.get("student_id", "") or "").strip()
+                if not student_id:
+                    continue
+                if student_id.startswith("TEMP_"):
+                    unnamed_candidates.append((student_id, float(row.get("peak_confidence", 0.0) or 0.0) + 5.0))
+                else:
+                    reportable_named.append(student_id)
 
-        return {student_id for student_id in reportable if student_id}
+        selected = {student_id for student_id in reportable_named if student_id}
+        if not self.roster_cap_enabled or self.roster_limit <= 0:
+            selected.update(student_id for student_id, _score in unnamed_candidates if student_id)
+            return selected
+        return capped_reportable_ids(reportable_named, unnamed_candidates, roster_limit=self.roster_limit)
 
     def _save_presence_report(self, csv_path: str):
         reportable = self._reportable_student_ids()

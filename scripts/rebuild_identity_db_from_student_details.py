@@ -37,12 +37,16 @@ from detectors.face_detector.run import (  # noqa: E402
 )
 from app.models.identity_enrichment import (  # noqa: E402
     current_utc_iso,
+    infer_lighting_bucket,
+    normalize_bank_family,
     infer_profile_bucket,
     infer_size_bucket,
 )
 
 
 SUPPORTED_IMAGE_EXTENSIONS = {".heic", ".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+LOCAL_AUGMENT_DIR = "augmentations_local"
+GENERATED_AUGMENT_DIR = "augmentations_generated"
 
 
 @dataclass
@@ -94,10 +98,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-face", type=int, default=8, help="Minimum face size in pixels.")
     parser.add_argument("--tile-grid", type=int, default=2, help="Tiled HEIC/photo detection grid.")
     parser.add_argument("--tile-overlap", type=float, default=0.20, help="Tile overlap ratio.")
+    parser.add_argument("--primary-detector", default="scrfd", help="Primary detector label used in metadata.")
+    parser.add_argument("--backup-detector", default="retinaface", help="Backup detector label used in metadata.")
+    parser.add_argument("--disable-backup-detector", action="store_true", help="Disable the backup detector pass.")
+    parser.add_argument("--adaface-weights", default="", help="Optional AdaFace ONNX weights.")
     parser.add_argument(
         "--max-images-per-student",
         type=int,
-        default=12,
+        default=48,
         help="Cap the number of images read per student folder.",
     )
     return parser.parse_args()
@@ -126,10 +134,24 @@ def iter_student_folders(base_dir: Path, max_images_per_student: int) -> list[St
         if not image_paths:
             continue
 
+        augmentation_paths: list[Path] = []
+        for augment_dir_name in (LOCAL_AUGMENT_DIR, GENERATED_AUGMENT_DIR):
+            augment_dir = folder / augment_dir_name
+            if augment_dir.exists():
+                augmentation_paths.extend(
+                    [
+                        path
+                        for path in sorted(augment_dir.iterdir(), key=lambda item: item.name.lower())
+                        if path.is_file()
+                        and path.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
+                        and path.name.lower().startswith("photo-")
+                    ]
+                )
+
         photo_paths = [path for path in image_paths if path.name.lower().startswith("photo-")]
         id_paths = [path for path in image_paths if path.name.lower().startswith("id-")]
         other_paths = [path for path in image_paths if path not in photo_paths and path not in id_paths]
-        ordered_paths = (photo_paths + id_paths + other_paths)[: max(1, int(max_images_per_student))]
+        ordered_paths = (photo_paths + id_paths + augmentation_paths + other_paths)[: max(1, int(max_images_per_student))]
 
         name, roll_number = split_student_key(folder.name)
         students.append(
@@ -142,6 +164,45 @@ def iter_student_folders(base_dir: Path, max_images_per_student: int) -> list[St
             )
         )
     return students
+
+
+def parse_augmentation_metadata(image_path: Path) -> dict[str, str]:
+    parent_name = image_path.parent.name.lower()
+    generator_type = "base"
+    if parent_name == LOCAL_AUGMENT_DIR:
+        generator_type = "local"
+    elif parent_name == GENERATED_AUGMENT_DIR:
+        generator_type = "hosted"
+    stem = image_path.stem
+    augmentation_family = ""
+    augmentation_tag = ""
+    combination_tag = ""
+    if "__local-" in stem:
+        encoded = stem.split("__local-", 1)[1]
+        augmentation_family, _, augmentation_tag = encoded.partition("--")
+    elif "__gen-" in stem:
+        encoded = stem.split("__gen-", 1)[1]
+        augmentation_family, _, augmentation_tag = encoded.partition("--")
+    elif "__firered-" in stem:
+        encoded = stem.split("__firered-", 1)[1]
+        augmentation_family, _, augmentation_tag = encoded.partition("--")
+
+    if augmentation_family == "combo":
+        combination_tag = augmentation_tag
+    bank_family = normalize_bank_family(
+        {
+            "augmentation_family": augmentation_family,
+            "augmentation_tag": augmentation_tag,
+            "combination_tag": combination_tag,
+        }
+    )
+    return {
+        "generator_type": generator_type,
+        "augmentation_family": augmentation_family,
+        "augmentation_tag": augmentation_tag,
+        "combination_tag": combination_tag,
+        "bank_family": bank_family,
+    }
 
 
 def read_image_bgr(path: Path) -> np.ndarray:
@@ -230,12 +291,21 @@ def create_seed_track(track_id: int, student: StudentFolder, backend: InsightFac
                 "source_kind": "seed",
                 "source_image": image_path.name,
                 "source_folder": student.folder.as_posix(),
+                **parse_augmentation_metadata(image_path),
                 "added_at": current_utc_iso(),
                 "quality": float(det.quality),
                 "score": float(det.score),
                 "face_size": face_size,
                 "profile_bucket": infer_profile_bucket(bbox, det.landmarks),
                 "size_bucket": infer_size_bucket(face_size),
+                "lighting_bucket": str((det.quality_profile or {}).get("lighting_bucket", infer_lighting_bucket(128.0, 0.0))),
+                "sharpness": float((det.quality_profile or {}).get("sharpness", 0.0) or 0.0),
+                "brightness": float((det.quality_profile or {}).get("brightness", 0.0) or 0.0),
+                "shadow_severity": float((det.quality_profile or {}).get("shadow_severity", 0.0) or 0.0),
+                "occlusion_ratio": float((det.quality_profile or {}).get("occlusion_ratio", 0.0) or 0.0),
+                "detector_used": str(det.detector_used or "scrfd"),
+                "embedder_used": str(det.embedder_used or "arcface"),
+                "source_token": f"{student.student_key}:{image_path.relative_to(student.folder).as_posix()}",
             },
             max_bank=48,
         )
@@ -388,6 +458,10 @@ def main() -> None:
         det_thresh=args.det_thresh,
         tile_grid=args.tile_grid,
         tile_overlap=args.tile_overlap,
+        primary_detector_name=args.primary_detector,
+        backup_detector_name=args.backup_detector,
+        enable_backup_detector=not bool(args.disable_backup_detector),
+        adaface_weights=args.adaface_weights or None,
     )
 
     backup_paths = backup_existing_files(

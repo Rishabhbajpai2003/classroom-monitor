@@ -12,6 +12,7 @@ import numpy as np
 
 from app.models.detectors import OpenVocabularyObjectDetector, PersonDetector, bbox_iou
 from app.models.pose_analyzer import PoseAnalyzer
+from app.models.roster_policy import capped_reportable_ids, roster_size
 from app.models.seat_events import SeatEventEngine
 from app.models.seat_map import (
     CameraMotionCompensator,
@@ -208,6 +209,10 @@ def _build_runtime_config(args) -> dict:
             "face_tile_grid": args.face_tile_grid,
             "face_tile_overlap": args.face_tile_overlap,
             "face_min_size": args.min_face,
+            "primary_detector": args.primary_detector,
+            "backup_detector": args.backup_detector,
+            "enable_backup_detector": not bool(args.disable_backup_detector),
+            "adaface_weights": args.adaface_weights,
             "identity_db_path": args.identity_db,
             "identity_db_save_every": args.identity_db_save_every,
             "full_min_height": args.full_min_height,
@@ -694,6 +699,7 @@ def run_pipeline(args):
     interval_tracker = ActivityIntervalTracker(fps_out)
     overlay_min_unnamed_frames = max(24, int(round(fps_out * 0.75)))
     overlay_min_unnamed_seconds = 3.0
+    roster_limit = roster_size("student-details")
 
     def remember_student_metadata(obs: StudentObservation) -> None:
         metadata = getattr(obs.face_track, "metadata", None) if obs.face_track is not None else None
@@ -717,6 +723,10 @@ def run_pipeline(args):
     def should_render_overlay(student_id: str, seat_id: str = "") -> bool:
         if not str(student_id).startswith("TEMP_"):
             return True
+        if roster_limit > 0:
+            named_present = sum(1 for key in records if key and not str(key).startswith("TEMP_"))
+            if named_present >= roster_limit:
+                return False
         record = records.get(student_id)
         if record is None:
             return False
@@ -930,17 +940,26 @@ def run_pipeline(args):
     seating_summary = seat_event_engine.get_student_summary() if seat_event_engine is not None else {}
     report_min_frames = max(60, int(round(fps_out * 2.0)))
     report_min_seconds = 8.0
-    reportable_person_ids = {
-        person_id
-        for person_id, record in records.items()
+    named_ids: list[str] = []
+    unnamed_candidates: list[tuple[str, float]] = []
+    for person_id, record in records.items():
+        person_key = str(person_id)
+        if not person_key:
+            continue
+        if not person_key.startswith("TEMP_"):
+            named_ids.append(person_key)
+            continue
         if (
-            not str(person_id).startswith("TEMP_")
-            or (
-                record.seen_frames >= report_min_frames
-                and (record.seen_frames / max(1e-6, fps_out)) >= report_min_seconds
-            )
-        )
-    }
+            record.seen_frames >= report_min_frames
+            and (record.seen_frames / max(1e-6, fps_out)) >= report_min_seconds
+        ):
+            unnamed_candidates.append((person_key, float(record.seen_frames) + float(max(record.proof_scores.values(), default=0.0))))
+    roster_limit = roster_size("student-details")
+    if roster_limit > 0:
+        reportable_person_ids = capped_reportable_ids(named_ids, unnamed_candidates, roster_limit=roster_limit)
+    else:
+        reportable_person_ids = {item for item in named_ids if item}
+        reportable_person_ids.update(item for item, _score in unnamed_candidates if item)
 
     if seat_calibration is not None and seat_reference_frame is not None:
         seat_map_json_path = activity_csv_path.parent / "seat_map.json"

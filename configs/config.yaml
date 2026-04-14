@@ -45,6 +45,13 @@ student_backbone:
   face_tile_grid: 3
   face_tile_overlap: 0.22
   face_min_size: 12
+  primary_detector: scrfd
+  backup_detector: retinaface
+  enable_backup_detector: true
+  adaface_weights: ""
+  attribute_classifier_weights: ""
+  attribute_classifier_config: ""
+  accessory_conf_threshold: 0.55
   identity_db_path: detectors/face_detector/identity_db.json
   identity_db_save_every: 150
   ttl: 120
@@ -70,9 +77,18 @@ student_backbone:
   continuity_bonus: 0.14
   strong_named_match_score: 0.72
   allow_new_identities: false
+  scene_change_threshold: 0.14
+  scene_unstable_inlier_ratio: 0.28
+  scene_downsample_width: 160
+  full_reid_interval: 24
   body_memory_frames: 18
   full_min_height: 160
   reduced_min_height: 96
+
+roster_policy:
+  student_details_root: student-details
+  hard_cap_reportable_identities: true
+  unknown_review_subdir: unknown_review
 
 attendance:
   presence_threshold_seconds: 30
@@ -113,6 +129,20 @@ attendance_events:
 speech_topics:
   config_path: configs/topic_profiles.yaml
   course_profile: default
+
+face_augmentation:
+  hosted_model_id: ""
+  prompt_style: "photo_realistic_identity_preserving"
+  retry_count: 2
+  sleep_seconds: 1.5
+  deterministic_families:
+    lighting: [shadow, low_light, backlight, harsh_light]
+    quality: [blur, low_resolution, noise, compression]
+    scale: [tiny_face, distant_face, partial_crop]
+  hosted_families:
+    pose: [left_profile, right_profile, slight_tilt, up_angle, down_angle]
+    accessory: [sunglasses, cap, mask, scarf]
+    combos: [cap_left_profile, sunglasses_slight_tilt, mask_down_angle, scarf_right_profile]
 
 system:
   device: auto

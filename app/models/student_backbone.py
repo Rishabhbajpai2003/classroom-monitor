@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 import numpy as np
+from app.models.frame_change import FrameChangeGate
 
 logger = logging.getLogger(__name__)
 
@@ -232,6 +233,13 @@ class SharedStudentBackbone:
         self.tile_grid = int(back_cfg.get("face_tile_grid", 3))
         self.tile_overlap = float(back_cfg.get("face_tile_overlap", 0.22))
         self.min_face = int(back_cfg.get("face_min_size", 12))
+        self.primary_detector = str(back_cfg.get("primary_detector", "scrfd"))
+        self.backup_detector = str(back_cfg.get("backup_detector", "retinaface"))
+        self.enable_backup_detector = bool(back_cfg.get("enable_backup_detector", True))
+        self.adaface_weights = str(back_cfg.get("adaface_weights", "") or "").strip()
+        self.attribute_classifier_weights = str(back_cfg.get("attribute_classifier_weights", "") or "").strip()
+        self.attribute_classifier_config = str(back_cfg.get("attribute_classifier_config", "") or "").strip()
+        self.accessory_conf_threshold = float(back_cfg.get("accessory_conf_threshold", 0.55))
         self.identity_db_path = str(
             back_cfg.get("identity_db_path", "detectors/face_detector/identity_db.json")
         )
@@ -239,11 +247,16 @@ class SharedStudentBackbone:
         self.body_memory_frames = int(back_cfg.get("body_memory_frames", 15))
         self.full_min_height = int(back_cfg.get("full_min_height", 160))
         self.reduced_min_height = int(back_cfg.get("reduced_min_height", 96))
+        self.scene_change_threshold = float(back_cfg.get("scene_change_threshold", 0.14))
+        self.scene_unstable_inlier_ratio = float(back_cfg.get("scene_unstable_inlier_ratio", 0.28))
+        self.scene_downsample_width = int(back_cfg.get("scene_downsample_width", 160))
+        self.full_reid_interval = int(back_cfg.get("full_reid_interval", 24))
         self.next_process_frame = 0.0
         self.process_period_frames = 1.0
         self.gap_fill_frames = 1
         self._video_fps: Optional[float] = None
         self._last_body_by_track: dict[int, tuple[int, dict]] = {}
+        self._frame_change_gate: Optional[FrameChangeGate] = None
 
         self._backend = None
         self._tracker = None
@@ -274,6 +287,13 @@ class SharedStudentBackbone:
             det_thresh=self.det_thresh,
             tile_grid=self.tile_grid,
             tile_overlap=self.tile_overlap,
+            primary_detector_name=self.primary_detector,
+            backup_detector_name=self.backup_detector,
+            enable_backup_detector=self.enable_backup_detector,
+            adaface_weights=self.adaface_weights or None,
+            attribute_classifier_weights=self.attribute_classifier_weights or None,
+            attribute_classifier_config=self.attribute_classifier_config or None,
+            accessory_conf_threshold=self.accessory_conf_threshold,
         )
         self._tracker = FaceTracker(
             sim_thresh=float(self.config.get("student_backbone", {}).get("sim_thresh", 0.45)),
@@ -309,6 +329,12 @@ class SharedStudentBackbone:
             allow_new_persistent_identities=bool(
                 self.config.get("student_backbone", {}).get("allow_new_identities", False)
             ),
+            full_reid_interval=self.full_reid_interval,
+        )
+        self._frame_change_gate = FrameChangeGate(
+            diff_threshold=self.scene_change_threshold,
+            unstable_inlier_ratio=self.scene_unstable_inlier_ratio,
+            downsample_width=self.scene_downsample_width,
         )
         self._identity_db = FaceIdentityDB(self.identity_db_path)
         next_track_id, stored_identities = self._identity_db.load()
@@ -342,6 +368,14 @@ class SharedStudentBackbone:
     ) -> list[StudentObservation]:
         if self._should_process_face(frame_idx, fps):
             detections = self._backend.infer(frame)
+            scene_state = self._frame_change_gate.update(frame) if self._frame_change_gate is not None else None
+            if scene_state is not None:
+                self._tracker.set_frame_context(
+                    frame_idx=frame_idx,
+                    scene_changed=scene_state.changed,
+                    scene_score=scene_state.score,
+                    motion_stable=scene_state.motion_stable,
+                )
             visible_tracks = self._tracker.step(detections, frame_idx)
         else:
             visible_tracks = self._get_gap_fill_tracks(self._tracker.tracks, frame_idx, self.gap_fill_frames)
